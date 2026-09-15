@@ -13,7 +13,7 @@ describe("local auth store", () => {
     expect(store.isSessionValid(session!)).toBe(true);
 
     const created = store.createClientKey("verification");
-    expect(created.token).toStartWith("sk-");
+    expect(created.token.startsWith("sk-")).toBe(true);
     expect(store.clientKey(created.token)).toBe(true);
 
     const restored = new LocalAuthStore(statePath);
