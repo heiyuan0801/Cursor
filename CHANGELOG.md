@@ -2,6 +2,40 @@
 
 All notable changes to the Windows app. Versions are the app/installer version.
 
+## Unreleased
+
+### Fixed
+- **Prompt caching now actually hits, and is visible in `usage`**
+  ([#1](https://github.com/NGLSG/Cursor2API/issues/1)). Relays such as New API bill from the
+  `usage` block and reported zero cached tokens on every request. Two separate causes:
+
+  - **Sessions were never reused for plain OpenAI clients.** 0.1.2 added agent reuse plus
+    incremental prompts, but it keyed the session off `x-session-affinity` /
+    `x-opencode-session-id`. Clients that send no such header — New API, LiteLLM, the official
+    SDKs, curl — fell back to a fresh random key per request, so every turn created a new
+    agent and re-fed the whole transcript. The Cloudflare Worker path never sent
+    `incrementalPrompt` at all, and `/v1/messages` deliberately started a new session per
+    request. Conversations are now recognized by their own content (`worker/chat-session.ts`):
+    the transcript a client replays is fingerprinted as it is answered and matched on the next
+    turn, so follow-up turns reach the warm agent and carry only the new messages. Headers
+    still win when present, and an unrecognized conversation just starts fresh — a cache miss,
+    never a lost context.
+  - **`usage` was fabricated locally.** Token counts came from `characters / 4` and
+    `cached_tokens` was hardcoded to `0`. The bridge now reads the real per-turn `TokenUsage`
+    from `@cursor/sdk` (`run.wait()` and the `usage` stream event) and threads it through to
+    the response: `prompt_tokens_details.cached_tokens` for OpenAI, `cache_read_input_tokens`
+    and `cache_creation_input_tokens` for Anthropic. Character estimates remain as a fallback
+    for paths the backend does not report usage for, and are now tagged `estimated: true`.
+
+- **Unrelated conversations could share one agent.** On the Worker path a request without a
+  session header fell back to the literal key `"default"`, so every conversation for an
+  account accumulated in a single SDK agent. They are now separated by conversation.
+
+### Changed
+- `npm test` covers the sidecar. Its tests import `bun:test` and were only reachable through
+  `npm run test:sidecar` (which needs Bun installed), so the Anthropic endpoint, credential
+  router, and local auth store were untested in the default suite.
+
 ## 0.2.0 — 2026-06-02
 
 ### Added

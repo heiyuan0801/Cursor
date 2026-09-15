@@ -1,6 +1,6 @@
 import { HttpError } from "./http";
 import { encodeSse } from "./sse";
-import type { CursorImage, CursorPrompt, CursorToolCall } from "./types";
+import type { CursorImage, CursorPrompt, CursorToolCall, CursorTokenUsage } from "./types";
 
 export type ApiKind = "chat" | "responses";
 
@@ -313,6 +313,8 @@ export function chatCompletionResponse(input: {
   toolCalls?: OpenAiToolCall[];
   promptChars: number;
   metadata?: Record<string, unknown>;
+  /** Real per-turn counts from Cursor. When absent, usage falls back to char estimates. */
+  usage?: CursorTokenUsage;
 }): Record<string, unknown> {
   const toolCalls = input.toolCalls ?? [];
   const completionChars = completionCharsFromOutput(input.text, toolCalls);
@@ -335,7 +337,7 @@ export function chatCompletionResponse(input: {
         finish_reason: toolCalls.length ? "tool_calls" : "stop"
       }
     ],
-    usage: usageFromChars(input.model, input.promptChars, completionChars),
+    usage: usageFromChars(input.model, input.promptChars, completionChars, input.usage),
     service_tier: "default",
     system_fingerprint: null,
     ...input.metadata
@@ -350,6 +352,7 @@ export function responseObject(input: {
   toolCalls?: OpenAiToolCall[];
   promptChars: number;
   metadata?: Record<string, unknown>;
+  usage?: CursorTokenUsage;
 }): Record<string, unknown> {
   const messageId = `msg_${input.id.slice(5)}`;
   const output: Record<string, unknown>[] = [];
@@ -406,7 +409,7 @@ export function responseObject(input: {
     tool_choice: "auto",
     tools: [],
     truncation: "disabled",
-    usage: responseUsageFromChars(input.model, input.promptChars, outputChars),
+    usage: responseUsageFromChars(input.model, input.promptChars, outputChars, input.usage),
     user: null,
     metadata: {},
     ...input.metadata
@@ -493,6 +496,7 @@ export function chatUsageChunk(input: {
   model: string;
   promptChars: number;
   completionChars: number;
+  usage?: CursorTokenUsage;
 }): Uint8Array {
   return encodeSse({
     id: input.id,
@@ -501,7 +505,7 @@ export function chatUsageChunk(input: {
     model: input.model,
     system_fingerprint: null,
     choices: [],
-    usage: usageFromChars(input.model, input.promptChars, input.completionChars)
+    usage: usageFromChars(input.model, input.promptChars, input.completionChars, input.usage)
   });
 }
 
@@ -670,6 +674,7 @@ export function responseDoneEvents(input: {
   metadata?: Record<string, unknown>;
   textStarted?: boolean;
   textOutputIndex?: number;
+  usage?: CursorTokenUsage;
 }): Uint8Array[] {
   const itemId = `msg_${input.id.slice(5)}`;
   const part = { type: "output_text", text: input.text, annotations: [] };
@@ -2228,34 +2233,74 @@ function imageFromUrl(url: string, metadata?: Record<string, unknown>): CursorIm
   return { url, ...(dimension ? { dimension } : {}) };
 }
 
-function usageFromChars(model: string, promptChars: number, completionChars: number) {
-  const promptTokens = estimateTokens(promptChars);
-  const completionTokens = estimateTokens(completionChars);
+/**
+ * Cursor reports `inputTokens`, `cacheReadTokens`, and `cacheWriteTokens` as disjoint parts
+ * of the prompt (the Anthropic convention). OpenAI's `prompt_tokens` is the whole prompt
+ * with `prompt_tokens_details.cached_tokens` as a subset of it, so the cache buckets have to
+ * be folded back in rather than reported alongside.
+ */
+function openAiTokenCounts(usage: CursorTokenUsage) {
+  const promptTokens = usage.inputTokens + usage.cacheReadTokens + usage.cacheWriteTokens;
   return {
-    prompt_tokens: promptTokens,
-    completion_tokens: completionTokens,
-    total_tokens: promptTokens + completionTokens,
-    prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
+    promptTokens,
+    completionTokens: usage.outputTokens,
+    cachedTokens: usage.cacheReadTokens,
+    cacheWriteTokens: usage.cacheWriteTokens,
+    reasoningTokens: usage.reasoningTokens ?? 0
+  };
+}
+
+function usageFromChars(model: string, promptChars: number, completionChars: number, usage?: CursorTokenUsage) {
+  const counts = usage
+    ? openAiTokenCounts(usage)
+    : {
+        promptTokens: estimateTokens(promptChars),
+        completionTokens: estimateTokens(completionChars),
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0
+      };
+  return {
+    prompt_tokens: counts.promptTokens,
+    completion_tokens: counts.completionTokens,
+    total_tokens: counts.promptTokens + counts.completionTokens,
+    prompt_tokens_details: {
+      cached_tokens: counts.cachedTokens,
+      cache_creation_tokens: counts.cacheWriteTokens,
+      audio_tokens: 0
+    },
     completion_tokens_details: {
-      reasoning_tokens: 0,
+      reasoning_tokens: counts.reasoningTokens,
       audio_tokens: 0,
       accepted_prediction_tokens: 0,
       rejected_prediction_tokens: 0
     },
-    cost: costFromTokens(model, promptTokens, completionTokens)
+    cost: costFromTokens(model, counts.promptTokens, counts.completionTokens),
+    ...(usage ? {} : { estimated: true })
   };
 }
 
-function responseUsageFromChars(model: string, inputChars: number, outputChars: number) {
-  const inputTokens = estimateTokens(inputChars);
-  const outputTokens = estimateTokens(outputChars);
+function responseUsageFromChars(model: string, inputChars: number, outputChars: number, usage?: CursorTokenUsage) {
+  const counts = usage
+    ? openAiTokenCounts(usage)
+    : {
+        promptTokens: estimateTokens(inputChars),
+        completionTokens: estimateTokens(outputChars),
+        cachedTokens: 0,
+        cacheWriteTokens: 0,
+        reasoningTokens: 0
+      };
   return {
-    input_tokens: inputTokens,
-    input_tokens_details: { cached_tokens: 0 },
-    output_tokens: outputTokens,
-    output_tokens_details: { reasoning_tokens: 0 },
-    total_tokens: inputTokens + outputTokens,
-    cost: costFromTokens(model, inputTokens, outputTokens)
+    input_tokens: counts.promptTokens,
+    input_tokens_details: {
+      cached_tokens: counts.cachedTokens,
+      cache_creation_tokens: counts.cacheWriteTokens
+    },
+    output_tokens: counts.completionTokens,
+    output_tokens_details: { reasoning_tokens: counts.reasoningTokens },
+    total_tokens: counts.promptTokens + counts.completionTokens,
+    cost: costFromTokens(model, counts.promptTokens, counts.completionTokens),
+    ...(usage ? {} : { estimated: true })
   };
 }
 

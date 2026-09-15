@@ -57,6 +57,7 @@ export {
   composerToolCallFromText,
   normalizeSDKToolCall,
   normalizeModel,
+  normalizeSdkTokenUsage,
   openAiError,
   runExclusiveForAgent,
   sdkRunFailureSummary,
@@ -292,6 +293,7 @@ async function runLocalAgentBody(input, onRun, onEvent) {
   let capturedToolCall = null;
   let cancelRequested = false;
   let text = "";
+  let streamedUsage;
 
   const captureToolCall = async (toolCall, options = {}) => {
     if (capturedToolCall || !toolCall) return;
@@ -346,6 +348,10 @@ async function runLocalAgentBody(input, onRun, onEvent) {
           }
           continue;
         }
+        if (event.type === "usage") {
+          streamedUsage = normalizeSdkTokenUsage(event.usage) ?? streamedUsage;
+          continue;
+        }
         if (event.type === "tool_call") {
           if (event.status && event.status !== "running") continue;
           await captureToolCall({ type: event.name, args: event.args }, { waitForCancel: false });
@@ -373,7 +379,11 @@ async function runLocalAgentBody(input, onRun, onEvent) {
       toolCalls: [capturedToolCall],
       agentID: agentEntry?.agent.agentId || "",
       runID: run?.id || input.requestId,
-      status: "tool_call"
+      status: "tool_call",
+      // The run was cancelled to hand the tool call back to the client, so `run.wait()`
+      // would not return usage. Whatever the stream already reported is all we get.
+      ...(streamedUsage ? { usage: streamedUsage } : {}),
+      ...(agentEntry?.cached ? { agentCached: true } : {})
     };
   }
 
@@ -383,12 +393,42 @@ async function runLocalAgentBody(input, onRun, onEvent) {
     throw sdkRunFailureError(result);
   }
   if (!text && typeof result.result === "string") text = result.result;
+  const usage = normalizeSdkTokenUsage(result.usage) ?? streamedUsage;
   return {
     text: stripFinalMarker(text),
     toolCalls: [],
     agentID: agentEntry?.agent.agentId || "",
     runID: run.id,
-    status: result.status
+    status: result.status,
+    ...(usage ? { usage } : {}),
+    ...(agentEntry?.cached ? { agentCached: true } : {})
+  };
+}
+
+/**
+ * Coerce a `TokenUsage` from `@cursor/sdk` into a plain JSON-safe shape. Returns undefined
+ * when the backend reported nothing, so callers can tell "no usage available" apart from a
+ * genuine all-zero turn.
+ */
+function normalizeSdkTokenUsage(usage) {
+  if (!usage || typeof usage !== "object") return undefined;
+  const count = (value) => (Number.isFinite(value) && value >= 0 ? Math.floor(value) : 0);
+  const inputTokens = count(usage.inputTokens);
+  const outputTokens = count(usage.outputTokens);
+  const cacheReadTokens = count(usage.cacheReadTokens);
+  const cacheWriteTokens = count(usage.cacheWriteTokens);
+  const reasoningTokens = count(usage.reasoningTokens);
+  const totalTokens = Number.isFinite(usage.totalTokens) && usage.totalTokens > 0
+    ? Math.floor(usage.totalTokens)
+    : inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  if (totalTokens === 0) return undefined;
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    totalTokens,
+    ...(reasoningTokens ? { reasoningTokens } : {})
   };
 }
 

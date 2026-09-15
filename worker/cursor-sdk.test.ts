@@ -47,6 +47,106 @@ describe("Cursor SDK harness", () => {
     expect(fetchCalls).toBe(3);
   });
 
+  it("surfaces the token usage the bridge reports for a run", async () => {
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-08-19T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async () =>
+          new Response(
+            JSON.stringify({
+              text: "OK",
+              toolCalls: [],
+              status: "completed",
+              usage: {
+                inputTokens: 120,
+                outputTokens: 40,
+                cacheReadTokens: 8000,
+                cacheWriteTokens: 300,
+                totalTokens: 8460
+              }
+            }),
+            { status: 200, headers: { "Content-Type": "application/json" } }
+          )
+      },
+      "cursor-test-key",
+      { prompt: { text: "Say OK" }, model: { id: "composer-2.5" }, sessionKey: "usage" }
+    );
+
+    await expect(collectCursorSdkOutput(completion.stream)).resolves.toMatchObject({
+      text: "OK",
+      usage: { cacheReadTokens: 8000, cacheWriteTokens: 300, inputTokens: 120, outputTokens: 40 }
+    });
+  });
+
+  it("leaves usage undefined when an older bridge reports none", async () => {
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-08-19T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async () =>
+          new Response(JSON.stringify({ text: "OK", toolCalls: [], status: "completed" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          })
+      },
+      "cursor-test-key",
+      { prompt: { text: "Say OK" }, model: { id: "composer-2.5" }, sessionKey: "no-usage" }
+    );
+
+    expect((await collectCursorSdkOutput(completion.stream)).usage).toBeUndefined();
+  });
+
+  it("forwards the incremental prompt so a warm bridge agent can reuse its cached prefix", async () => {
+    let body: Record<string, unknown> = {};
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-08-19T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async (_url: any, init: any) => {
+          body = JSON.parse(String(init.body));
+          return new Response(JSON.stringify({ text: "OK", toolCalls: [], status: "completed" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      },
+      "cursor-test-key",
+      {
+        prompt: { text: "FULL TRANSCRIPT" },
+        incrementalPrompt: { text: "ONLY THE NEW TURN" },
+        model: { id: "composer-2.5" },
+        sessionKey: "incremental"
+      }
+    );
+    await collectCursorSdkOutput(completion.stream);
+
+    expect(body.prompt).toBe("FULL TRANSCRIPT");
+    expect(body.incrementalPrompt).toBe("ONLY THE NEW TURN");
+  });
+
+  it("reuses one agent id across turns of the same session", async () => {
+    const env = { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any;
+    const deps = {
+      now: () => new Date("2026-08-19T00:00:00Z"),
+      randomUUID: () => crypto.randomUUID(),
+      fetch: async () =>
+        new Response(JSON.stringify({ text: "OK", toolCalls: [], status: "completed" }), {
+          status: 200,
+          headers: { "Content-Type": "application/json" }
+        })
+    };
+    const first = await createCursorSdkCompletion(env, deps, "k", { prompt: { text: "a" }, sessionKey: "same" });
+    const second = await createCursorSdkCompletion(env, deps, "k", { prompt: { text: "b" }, sessionKey: "same" });
+    const other = await createCursorSdkCompletion(env, deps, "k", { prompt: { text: "c" }, sessionKey: "different" });
+
+    expect(second.agentId).toBe(first.agentId);
+    expect(other.agentId).not.toBe(first.agentId);
+  });
+
   it("does not emit incomplete SDK tool-call starts to OpenCode", () => {
     expect(cursorSdkTestExports.isEmittableSdkToolCall({ name: "glob", arguments: {} })).toBe(false);
     expect(cursorSdkTestExports.isEmittableSdkToolCall({ name: "edit", arguments: {} })).toBe(false);

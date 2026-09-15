@@ -34,7 +34,15 @@ import {
 } from "./openai";
 import { submitWaitlist } from "./waitlist";
 import { encodeSse } from "./sse";
-import type { Deps, Env } from "./types";
+import {
+  chatMessagesFromBody,
+  newTurnMessages,
+  newTurnStartIndex,
+  rememberChatSession,
+  resolveChatSession,
+  type ChatSessionMessage
+} from "./chat-session";
+import type { CursorPrompt, CursorTokenUsage, Deps, Env } from "./types";
 import type { CursorTextEvent } from "./cursor";
 import type { ToolCallContext } from "./openai";
 import type { OpenAiToolSpec } from "./openai";
@@ -566,9 +574,14 @@ async function handleOpenAiCompletion(
         });
   const id = `${route.kind === "chat" ? "chatcmpl" : "resp"}_${crypto.randomUUID().replaceAll("-", "")}`;
   const created = Math.floor(deps.now().getTime() / 1000);
+  // Chat has no request id to chain on, so recognize a continuing conversation by its
+  // content. Without this every keyless client collapses onto one shared "default" session.
+  const chatSession = route.kind === "chat" && shouldUseSdkForPreparedRoute(env, { ...route, kind: "chat" })
+    ? await resolveChatCompletionSession(request, deps, auth, body, cursorModel)
+    : undefined;
   const sdkSessionKey = route.kind === "responses"
     ? previousState?.sdkSessionKey || sessionAffinity(request) || id
-    : sessionAffinity(request);
+    : chatSession?.sessionKey ?? sessionAffinity(request);
   const completionRoute: CompletionRoute =
     route.kind === "chat" ? { ...route, kind: "chat" } : { ...route, kind: "responses" };
 
@@ -601,6 +614,7 @@ async function handleOpenAiCompletion(
         created,
         responseOwner,
         sdkSessionKey,
+        chatSession,
         finishLog
       });
     }
@@ -711,6 +725,67 @@ async function handleOpenAiCompletion(
   }
 }
 
+interface ChatCompletionSession {
+  sessionKey: string;
+  incrementalPrompt?: CursorPrompt;
+  remember: (text: string, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => void;
+}
+
+/**
+ * Pick the SDK session for a chat request and work out which messages are new. An explicit
+ * affinity header wins; otherwise the conversation is recognized by its own content, so a
+ * follow-up turn reaches the warm agent and carries only the new messages — the combination
+ * the SDK needs for its prompt prefix cache to hit.
+ */
+async function resolveChatCompletionSession(
+  request: Request,
+  deps: Deps,
+  auth: AuthResult,
+  body: unknown,
+  cursorModel: { id: string } | undefined
+): Promise<ChatCompletionSession> {
+  const messages = chatMessagesFromBody(body);
+  const ownerKey = sdkSessionOwner(auth) || `cursor-key:${auth.cursorApiKey}`;
+  const explicit = sessionAffinity(request);
+  const now = deps.now().getTime();
+  const resolution = explicit
+    ? { sessionKey: explicit, newTurnStart: newTurnStartIndex(messages), resumed: true }
+    : await resolveChatSession(messages, ownerKey, now, () => `session-${deps.randomUUID()}`);
+  const newTurn = newTurnMessages(messages, resolution);
+  return {
+    sessionKey: resolution.sessionKey,
+    incrementalPrompt: chatIncrementalPrompt(body, cursorModel, newTurn),
+    remember: (text, toolCalls) => {
+      void rememberChatSession({
+        messages,
+        ownerKey,
+        sessionKey: resolution.sessionKey,
+        assistantText: text,
+        assistantToolCalls: toolCalls,
+        now: deps.now().getTime()
+      }).catch(() => undefined);
+    }
+  };
+}
+
+/**
+ * The new turn rendered as a Cursor prompt. The bridge only uses it while its agent is still
+ * warm and otherwise re-sends the full prompt, so an over-eager delta can never lose context.
+ */
+function chatIncrementalPrompt(
+  body: unknown,
+  cursorModel: { id: string } | undefined,
+  newTurn: ChatSessionMessage[]
+): CursorPrompt | undefined {
+  if (!newTurn.length) return undefined;
+  try {
+    const deltaBody = { ...(body as Record<string, unknown>), messages: newTurn, stream: false };
+    return prepareChatRequest(deltaBody, cursorModel).prompt;
+  } catch {
+    return undefined;
+  }
+}
+
 async function handleSdkPreparedOpenAiRoute(input: {
   route: CompletionRoute;
   prepared: ReturnType<typeof prepareChatRequest> | ReturnType<typeof prepareResponsesRequest>;
@@ -724,6 +799,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
   created: number;
   responseOwner?: string;
   sdkSessionKey?: string;
+  chatSession?: ChatCompletionSession;
   finishLog: (input: Parameters<typeof completeRequestLog>[2]) => Promise<void>;
 }): Promise<Response> {
   const completion = await createCursorSdkCompletion(input.env, input.deps, input.auth.cursorApiKey, {
@@ -731,6 +807,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
     model: input.prepared.cursorModel,
     sessionKey: input.sdkSessionKey || sessionAffinity(input.request),
     sessionOwnerKey: sdkSessionOwner(input.auth),
+    incrementalPrompt: input.chatSession?.incrementalPrompt,
     workingDirectory: input.prepared.toolContext?.workingDirectory,
     clientTools: input.prepared.tools,
     requiresLocalTool: input.prepared.requiresLocalTool,
@@ -758,7 +835,8 @@ async function handleSdkPreparedOpenAiRoute(input: {
       tools: input.prepared.tools,
       context: input.prepared.toolContext,
       onBillingError: input.onBillingError,
-      onDone: async (text, completionChars, toolCalls) => {
+      onDone: async (text, completionChars, toolCalls, usage) => {
+        input.chatSession?.remember(text, toolCalls);
         if (input.route.kind === "responses" && input.responseOwner) {
           const completed = responseObject({
             id: input.id,
@@ -767,7 +845,8 @@ async function handleSdkPreparedOpenAiRoute(input: {
             text,
             toolCalls,
             promptChars: input.prepared.promptChars,
-            metadata: input.prepared.responseMetadata
+            metadata: input.prepared.responseMetadata,
+            usage
           });
           storeResponseState(input.responseOwner, {
             id: input.id,
@@ -804,6 +883,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
     context: input.prepared.toolContext
   });
   const completionChars = completionCharsFromOutput(output.text, toolCalls);
+  input.chatSession?.remember(output.text, toolCalls);
   await input.finishLog({
     status: "completed",
     completionChars,
@@ -820,7 +900,8 @@ async function handleSdkPreparedOpenAiRoute(input: {
         text: output.text,
         toolCalls,
         promptChars: input.prepared.promptChars,
-        metadata: input.prepared.responseMetadata
+        metadata: input.prepared.responseMetadata,
+        usage: output.usage
       })
     );
   }
@@ -832,7 +913,8 @@ async function handleSdkPreparedOpenAiRoute(input: {
     text: output.text,
     toolCalls,
     promptChars: input.prepared.promptChars,
-    metadata: input.prepared.responseMetadata
+    metadata: input.prepared.responseMetadata,
+    usage: output.usage
   });
   if (input.responseOwner) {
     storeResponseState(input.responseOwner, {
@@ -955,7 +1037,8 @@ async function handleOpenCodeSdkChatRoute(
         text: output.text,
         toolCalls,
         promptChars: prepared.promptChars,
-        metadata: prepared.responseMetadata
+        metadata: prepared.responseMetadata,
+        usage: output.usage
       })
     );
   } catch (error) {
@@ -980,7 +1063,12 @@ function streamOpenAiResponse(
     tools: OpenAiToolSpec[];
     context?: ToolCallContext;
     onBillingError?: (error: unknown) => Promise<void>;
-    onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => Promise<void>;
+    onDone: (
+      text: string,
+      completionChars: number,
+      toolCalls: ReturnType<typeof toOpenAiToolCalls>,
+      usage?: CursorTokenUsage
+    ) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   },
   ctx: ExecutionContext
@@ -1001,7 +1089,12 @@ function streamOpenAiEvents(
     tools: OpenAiToolSpec[];
     context?: ToolCallContext;
     onBillingError?: (error: unknown) => Promise<void>;
-    onDone: (text: string, completionChars: number, toolCalls: ReturnType<typeof toOpenAiToolCalls>) => Promise<void>;
+    onDone: (
+      text: string,
+      completionChars: number,
+      toolCalls: ReturnType<typeof toOpenAiToolCalls>,
+      usage?: CursorTokenUsage
+    ) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   },
   ctx: ExecutionContext
@@ -1015,6 +1108,7 @@ function streamOpenAiEvents(
     const streamedToolCalls: ReturnType<typeof toOpenAiToolCalls> = [];
     let responseNextOutputIndex = 0;
     let responseTextOutputIndex: number | null = null;
+    let usage: CursorTokenUsage | undefined;
     try {
       if (kind === "chat") {
         await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
@@ -1056,6 +1150,7 @@ function streamOpenAiEvents(
         }
         if (event.type === "done") {
           text = event.finalText;
+          usage = event.usage ?? usage;
         }
       }
 
@@ -1069,7 +1164,8 @@ function streamOpenAiEvents(
               created: input.created,
               model: input.model,
               promptChars: input.promptChars,
-              completionChars
+              completionChars,
+              usage
             })
           );
         }
@@ -1085,10 +1181,11 @@ function streamOpenAiEvents(
           text,
           toolCalls: streamedToolCalls,
           textStarted: responseTextOutputIndex !== null,
-          textOutputIndex: responseTextOutputIndex ?? 0
+          textOutputIndex: responseTextOutputIndex ?? 0,
+          usage
         })) await writer.write(event);
       }
-      await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
+      await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls, usage);
     } catch (error) {
       if (input.onBillingError && isBillingError(error)) {
         await input.onBillingError(error).catch(() => undefined);

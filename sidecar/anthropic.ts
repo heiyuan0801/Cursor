@@ -10,7 +10,7 @@
  * See docs/superpowers/specs/2026-06-02-anthropic-endpoint-claude-code-design.md.
  */
 import type { CursorTextEvent } from "../worker/cursor";
-import type { CursorToolCall } from "../worker/types";
+import type { CursorTokenUsage, CursorToolCall } from "../worker/types";
 import { toOpenAiToolCalls, type OpenAiToolSpec, type ToolCallContext } from "../worker/openai";
 
 const PRIMARY_MODEL = "auto";
@@ -52,6 +52,29 @@ export function contextFromAnthropicBeta(value: unknown): string | undefined {
 /** Estimate tokens from a character count (count_tokens / usage are non-exact by design). */
 export function estimateTokens(chars: number): number {
   return Math.max(1, Math.ceil(chars / 4));
+}
+
+/**
+ * Anthropic's `usage` block. Cursor already reports `inputTokens` exclusive of the cached
+ * buckets, which is exactly Anthropic's convention, so the counts map across one-to-one.
+ * Without real usage we fall back to the character estimate and report no cache activity,
+ * since claiming a zero cache read is more honest than omitting the field entirely.
+ */
+export function anthropicUsage(estimatedInputTokens: number, outputTokens: number, usage?: CursorTokenUsage) {
+  if (!usage) {
+    return {
+      input_tokens: estimatedInputTokens,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: outputTokens
+    };
+  }
+  return {
+    input_tokens: usage.inputTokens,
+    cache_creation_input_tokens: usage.cacheWriteTokens,
+    cache_read_input_tokens: usage.cacheReadTokens,
+    output_tokens: usage.outputTokens
+  };
 }
 
 /** Anthropic error envelope. */
@@ -253,6 +276,24 @@ export function mapAnthropicToolCall(input: {
   };
 }
 
+/**
+ * The assistant's tool calls in the OpenAI shape `anthropicToChatBody` will produce when the
+ * client replays them next turn. Conversation fingerprints have to be built from this shape,
+ * not from the Cursor-side call, or a tool-using turn never matches its own continuation.
+ */
+export function toolCallsForSessionFingerprint(
+  blocks: ReadonlyArray<Record<string, unknown>>
+): Array<{ function: { name: string; arguments: string } }> {
+  return blocks
+    .filter((block) => block.type === "tool_use")
+    .map((block) => ({
+      function: {
+        name: typeof block.name === "string" ? block.name : "",
+        arguments: JSON.stringify(block.input ?? {})
+      }
+    }));
+}
+
 /** Build a non-stream Anthropic `Message` object. */
 export function anthropicMessage(opts: {
   id: string;
@@ -263,6 +304,7 @@ export function anthropicMessage(opts: {
   toolContext?: ToolCallContext;
   inputTokens: number;
   outputTokens: number;
+  usage?: CursorTokenUsage;
 }): Record<string, unknown> {
   const content: Array<Record<string, unknown>> = [];
   if (opts.text) content.push({ type: "text", text: opts.text });
@@ -283,7 +325,7 @@ export function anthropicMessage(opts: {
     content,
     stop_reason: emittedToolCalls ? "tool_use" : "end_turn",
     stop_sequence: null,
-    usage: { input_tokens: opts.inputTokens, output_tokens: opts.outputTokens }
+    usage: anthropicUsage(opts.inputTokens, opts.outputTokens, opts.usage)
   };
 }
 
@@ -296,6 +338,9 @@ export async function* anthropicSseEvents(opts: {
   stream: AsyncIterable<CursorTextEvent>;
   tools?: OpenAiToolSpec[];
   toolContext?: ToolCallContext;
+  /** Called once the stream finishes cleanly, with the assistant turn as the client will
+   * replay it: the completed text and the tool_use blocks that were emitted. */
+  onDone?: (text: string, toolUseBlocks: Array<Record<string, unknown>>) => void;
 }): AsyncGenerator<{ event: string; data: Record<string, unknown> }> {
   yield {
     event: "message_start",
@@ -309,7 +354,9 @@ export async function* anthropicSseEvents(opts: {
         content: [],
         stop_reason: null,
         stop_sequence: null,
-        usage: { input_tokens: opts.inputTokens, output_tokens: 1 }
+        // Real token counts only arrive with the terminating `done` event, so the opening
+        // frame carries the prompt estimate and the final `message_delta` corrects it.
+        usage: { ...anthropicUsage(opts.inputTokens, 1), output_tokens: 1 }
       }
     }
   };
@@ -319,6 +366,9 @@ export async function* anthropicSseEvents(opts: {
   let outputChars = 0;
   let sawTool = false;
   let toolCallIndex = 0;
+  let usage: CursorTokenUsage | undefined;
+  let text = "";
+  const toolUseBlocks: Array<Record<string, unknown>> = [];
 
   for await (const event of opts.stream) {
     if (event.type === "text" && event.text) {
@@ -327,6 +377,7 @@ export async function* anthropicSseEvents(opts: {
         yield { event: "content_block_start", data: { type: "content_block_start", index: textIndex, content_block: { type: "text", text: "" } } };
       }
       outputChars += event.text.length;
+      text += event.text;
       yield { event: "content_block_delta", data: { type: "content_block_delta", index: textIndex, delta: { type: "text_delta", text: event.text } } };
     } else if (event.type === "tool_call" && event.toolCall) {
       const mapped = opts.tools?.length
@@ -346,12 +397,15 @@ export async function* anthropicSseEvents(opts: {
       }
       const idx = nextIndex++;
       const block = toolUseBlock(mapped);
+      toolUseBlocks.push(block);
       const input = block.input as Record<string, unknown>;
       yield { event: "content_block_start", data: { type: "content_block_start", index: idx, content_block: { type: "tool_use", id: block.id, name: block.name, input: {} } } };
       yield { event: "content_block_delta", data: { type: "content_block_delta", index: idx, delta: { type: "input_json_delta", partial_json: JSON.stringify(input) } } };
       yield { event: "content_block_stop", data: { type: "content_block_stop", index: idx } };
       sawTool = true;
     } else if (event.type === "done") {
+      usage = event.usage ?? usage;
+      text = event.finalText || text;
       break;
     }
   }
@@ -361,7 +415,12 @@ export async function* anthropicSseEvents(opts: {
   }
   yield {
     event: "message_delta",
-    data: { type: "message_delta", delta: { stop_reason: sawTool ? "tool_use" : "end_turn", stop_sequence: null }, usage: { output_tokens: estimateTokens(outputChars) } }
+    data: {
+      type: "message_delta",
+      delta: { stop_reason: sawTool ? "tool_use" : "end_turn", stop_sequence: null },
+      usage: anthropicUsage(opts.inputTokens, estimateTokens(outputChars), usage)
+    }
   };
   yield { event: "message_stop", data: { type: "message_stop" } };
+  opts.onDone?.(text, toolUseBlocks);
 }

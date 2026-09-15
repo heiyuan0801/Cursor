@@ -1,6 +1,8 @@
 import { HttpError } from "./http";
 import { parseSse } from "./sse";
-import type { CursorCompletion, CursorImage, CursorMe, CursorPrompt, CursorToolCall, Deps, Env } from "./types";
+import type { CursorCompletion, CursorImage, CursorMe, CursorPrompt, CursorToolCall, CursorTokenUsage, Deps, Env } from "./types";
+
+export type { CursorTokenUsage } from "./types";
 
 interface CursorModelResponse {
   items?: Array<{ id: string; displayName?: string; aliases?: string[] }>;
@@ -87,7 +89,7 @@ export type CursorTextEvent =
   | { type: "text"; text: string }
   | { type: "tool_call"; toolCall: CursorToolCall }
   | { type: "rejected_tool_call"; toolCall: CursorToolCall; reason?: string }
-  | { type: "done"; finalText: string; toolCalls: CursorToolCall[] };
+  | { type: "done"; finalText: string; toolCalls: CursorToolCall[]; usage?: CursorTokenUsage };
 
 export async function* streamCursorText(response: Response): AsyncGenerator<CursorTextEvent> {
   const contentType = response.headers.get("content-type") || "";
@@ -244,6 +246,7 @@ async function* streamLegacyAgentText(response: Response): AsyncGenerator<Cursor
 export interface CursorCollectedOutput {
   text: string;
   toolCalls: CursorToolCall[];
+  usage?: CursorTokenUsage;
 }
 
 export async function collectCursorOutput(response: Response): Promise<CursorCollectedOutput> {

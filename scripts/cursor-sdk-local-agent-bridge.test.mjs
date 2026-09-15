@@ -14,6 +14,7 @@ import {
   isRetryableSDKRunError,
   normalizeModel,
   normalizeSDKToolCall,
+  normalizeSdkTokenUsage,
   openAiError,
   runExclusiveForAgent,
   sdkRunFailureSummary,
@@ -25,6 +26,39 @@ import {
 const bridgeScriptPath = fileURLToPath(new URL("./cursor-sdk-local-agent-bridge.mjs", import.meta.url));
 
 describe("Cursor SDK local-agent bridge", () => {
+  it("normalizes the SDK's token usage, including the cache buckets", () => {
+    expect(normalizeSdkTokenUsage({
+      inputTokens: 120,
+      outputTokens: 40,
+      cacheReadTokens: 8000,
+      cacheWriteTokens: 300,
+      totalTokens: 8460,
+      reasoningTokens: 12
+    })).toEqual({
+      inputTokens: 120,
+      outputTokens: 40,
+      cacheReadTokens: 8000,
+      cacheWriteTokens: 300,
+      totalTokens: 8460,
+      reasoningTokens: 12
+    });
+  });
+
+  it("derives a total when the SDK omits one", () => {
+    expect(normalizeSdkTokenUsage({
+      inputTokens: 10,
+      outputTokens: 5,
+      cacheReadTokens: 900,
+      cacheWriteTokens: 0
+    })).toMatchObject({ totalTokens: 915, cacheReadTokens: 900 });
+  });
+
+  it("reports no usage rather than an all-zero turn", () => {
+    expect(normalizeSdkTokenUsage(undefined)).toBeUndefined();
+    expect(normalizeSdkTokenUsage({})).toBeUndefined();
+    expect(normalizeSdkTokenUsage({ inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 })).toBeUndefined();
+  });
+
   it("recovers structured client calls from Composer marker text", () => {
     expect(composerToolCallFromText([
       "<|tool_calls_begin|><|tool_call_begin|>",

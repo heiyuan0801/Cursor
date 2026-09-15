@@ -53,12 +53,20 @@ import {
 } from "../worker/openai";
 import { collectCursorOutput } from "../worker/cursor";
 import {
+  chatMessagesFromBody,
+  newTurnMessages,
+  newTurnStartIndex,
+  rememberChatSession,
+  resolveChatSession,
+  type ChatSessionMessage
+} from "../worker/chat-session";
+import {
   createCursorSdkCompletion,
   collectCursorSdkOutput,
   isTransientCursorSdkError
 } from "../worker/cursor-sdk";
 import { encodeSse } from "../worker/sse";
-import type { CursorToolCall, Deps, Env } from "../worker/types";
+import type { CursorTokenUsage, CursorToolCall, Deps, Env } from "../worker/types";
 import {
   anthropicError,
   anthropicMessage,
@@ -66,7 +74,8 @@ import {
   anthropicToChatBody,
   contextFromAnthropicBeta,
   estimateTokens,
-  mapModel
+  mapModel,
+  toolCallsForSessionFingerprint
 } from "./anthropic";
 import {
   canonicalModelId,
@@ -137,11 +146,11 @@ function hasSdkBridge(): boolean {
 }
 
 /**
- * Derive a stable session key so multi-turn conversations reuse the same SDK
- * agent. Mirrors the worker's session-affinity headers, falling back to a fresh
- * UUID when the client provides none.
+ * Session key explicitly supplied by the client. Returns undefined when the client sends no
+ * affinity header, which is the norm for plain OpenAI callers — those fall back to the
+ * conversation fingerprint in `worker/chat-session.ts`.
  */
-function sessionAffinity(request: Request): string {
+function explicitSessionAffinity(request: Request): string | undefined {
   const headers = request.headers;
   const candidate =
     headers.get("x-session-affinity") ||
@@ -149,8 +158,16 @@ function sessionAffinity(request: Request): string {
     headers.get("x-opencode-session") ||
     headers.get("idempotency-key") ||
     "";
-  const trimmed = candidate.trim();
-  return trimmed || `session-${crypto.randomUUID()}`;
+  return candidate.trim() || undefined;
+}
+
+/**
+ * Derive a stable session key so multi-turn conversations reuse the same SDK
+ * agent. Mirrors the worker's session-affinity headers, falling back to a fresh
+ * UUID when the client provides none.
+ */
+function sessionAffinity(request: Request): string {
+  return explicitSessionAffinity(request) || `session-${crypto.randomUUID()}`;
 }
 
 /**
@@ -667,7 +684,27 @@ async function handleChatCompletionsWithKey(
   const created = Math.floor(deps.now().getTime() / 1000);
 
   if (hasSdkBridge()) {
-    return handleSdkRoute("chat", request, prepared, apiKey, id, created, chatIncrementalPrompt(body, cursorModel), onBillingError);
+    const messages = chatMessagesFromBody(body);
+    const ownerKey = sdkSessionOwner(apiKey);
+    const explicit = explicitSessionAffinity(request);
+    // An explicit affinity header wins; otherwise recognize the conversation by its content
+    // so plain OpenAI clients get agent reuse (and therefore prefix-cache hits) too.
+    const session = explicit
+      ? { sessionKey: explicit, newTurnStart: newTurnStartIndex(messages), resumed: true }
+      : await resolveChatSession(messages, ownerKey, deps.now().getTime(), () => `session-${crypto.randomUUID()}`);
+    return handleSdkRoute("chat", request, prepared, apiKey, id, created, {
+      sessionKey: session.sessionKey,
+      incrementalPrompt: chatIncrementalPrompt(body, cursorModel, newTurnMessages(messages, session)),
+      remember: (text, toolCalls) =>
+        rememberChatSession({
+          messages,
+          ownerKey,
+          sessionKey: session.sessionKey,
+          assistantText: text,
+          assistantToolCalls: toolCalls,
+          now: deps.now().getTime()
+        }).catch(() => undefined)
+    }, onBillingError);
   }
 
   const completion = await createCursorCompletion(env, deps, apiKey, {
@@ -842,28 +879,19 @@ function retryingSdkStream(
 }
 
 /**
- * The incremental "new turn" for a follow-up chat request: every message after the last
- * assistant message. Returned as a CursorPrompt so a still-cached SDK agent receives only
- * the new turn instead of the whole conversation. Undefined on the first turn (no prior
- * assistant) — then the bridge uses the full prompt.
+ * The incremental "new turn" for a follow-up chat request: the messages the resolved session
+ * has not seen yet. Returned as a CursorPrompt so a still-cached SDK agent receives only the
+ * new turn instead of the whole conversation, which is what lets the SDK's prefix cache hit.
+ * Undefined on a first turn — then the bridge uses the full prompt.
  */
 function chatIncrementalPrompt(
   body: unknown,
-  cursorModel: { id: string }
+  cursorModel: { id: string },
+  newTurn: ChatSessionMessage[]
 ): ReturnType<typeof prepareChatRequest>["prompt"] | undefined {
-  const messages = (body as { messages?: Array<{ role?: string }> } | null)?.messages;
-  if (!Array.isArray(messages) || messages.length === 0) return undefined;
-  let lastAssistant = -1;
-  for (let i = messages.length - 1; i >= 0; i -= 1) {
-    if (messages[i]?.role === "assistant") {
-      lastAssistant = i;
-      break;
-    }
-  }
-  if (lastAssistant < 0 || lastAssistant >= messages.length - 1) return undefined;
-  const tail = messages.slice(lastAssistant + 1);
+  if (!newTurn.length) return undefined;
   try {
-    const deltaBody = { ...(body as Record<string, unknown>), messages: tail, stream: false };
+    const deltaBody = { ...(body as Record<string, unknown>), messages: newTurn, stream: false };
     return prepareChatRequest(deltaBody as Parameters<typeof prepareChatRequest>[0], cursorModel).prompt;
   } catch {
     return undefined;
@@ -938,14 +966,32 @@ async function handleAnthropicMessagesWithKey(
   const id = `msg_${crypto.randomUUID().replaceAll("-", "")}`;
   const inputTokens = estimateTokens(prepared.promptChars);
 
-  // Claude Code resends the full conversation (incl. tool_result) every turn, so /v1/messages is
-  // stateless: a fresh SDK session + full prompt per request, plus the transparent auto-retry.
-  const makeStream = async (_attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
+  // Claude Code resends the full conversation (incl. tool_result) every turn. Rather than
+  // burning a fresh agent per request, recognize the conversation by its content so the
+  // follow-up turns land on the warm agent and only carry the new messages — that is what
+  // makes the SDK's prefix cache hit and shows up as cache_read_input_tokens.
+  const messages = chatMessagesFromBody(translatedBody);
+  const ownerKey = sdkSessionOwner(apiKey);
+  const session = await resolveChatSession(messages, ownerKey, deps.now().getTime(), () => `cc-${crypto.randomUUID()}`);
+  const incrementalPrompt = chatIncrementalPrompt(translatedBody, cursorModel, newTurnMessages(messages, session));
+  const remember = (text: string, toolUseBlocks: Array<Record<string, unknown>>): void => {
+    void rememberChatSession({
+      messages,
+      ownerKey,
+      sessionKey: session.sessionKey,
+      assistantText: text,
+      assistantToolCalls: toolCallsForSessionFingerprint(toolUseBlocks),
+      now: deps.now().getTime()
+    }).catch(() => undefined);
+  };
+
+  const makeStream = async (attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
     const completion = await createCursorSdkCompletion(env, deps, apiKey, {
       prompt: prepared.prompt,
       model: prepared.cursorModel,
-      sessionKey: `cc-${crypto.randomUUID()}`,
-      sessionOwnerKey: sdkSessionOwner(apiKey),
+      sessionKey: attempt === 0 ? session.sessionKey : `cc-retry-${crypto.randomUUID()}`,
+      sessionOwnerKey: ownerKey,
+      incrementalPrompt: attempt === 0 ? incrementalPrompt : undefined,
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
@@ -962,23 +1008,26 @@ async function handleAnthropicMessagesWithKey(
       inputTokens,
       stream,
       tools: prepared.tools,
-      toolContext: prepared.toolContext
+      toolContext: prepared.toolContext,
+      onDone: remember
     }), onBillingError);
   }
 
   const output = await collectCursorSdkOutput(stream);
-  return json(
-    anthropicMessage({
-      id,
-      model: requestedModel,
-      text: output.text,
-      toolCalls: output.toolCalls,
-      tools: prepared.tools,
-      toolContext: prepared.toolContext,
-      inputTokens,
-      outputTokens: estimateTokens(output.text.length)
-    })
-  );
+  const message = anthropicMessage({
+    id,
+    model: requestedModel,
+    text: output.text,
+    toolCalls: output.toolCalls,
+    tools: prepared.tools,
+    toolContext: prepared.toolContext,
+    inputTokens,
+    outputTokens: estimateTokens(output.text.length),
+    usage: output.usage
+  });
+  // Fingerprint the turn the client will replay, which is the message we are about to send.
+  remember(output.text, message.content as Array<Record<string, unknown>>);
+  return json(message);
 }
 
 /** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Uses the
@@ -991,6 +1040,13 @@ async function handleCountTokens(request: Request): Promise<Response> {
   return json({ input_tokens: estimateTokens(prepared.promptChars) });
 }
 
+interface SdkRouteSession {
+  sessionKey: string;
+  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"];
+  /** Record the answered conversation so the client's next turn resolves to this session. */
+  remember?: (text: string, toolCalls: OpenAiToolCall[]) => void;
+}
+
 async function handleSdkRoute(
   kind: "chat" | "responses",
   request: Request,
@@ -998,24 +1054,24 @@ async function handleSdkRoute(
   apiKey: string,
   id: string,
   created: number,
-  incrementalPrompt?: ReturnType<typeof prepareChatRequest>["prompt"],
+  session?: SdkRouteSession,
   onBillingError?: (error: unknown) => void
 ): Promise<Response> {
   logToolForwarding(kind, prepared);
-  // Maintain one SDK agent per client session "under the hood": attempt 0 reuses the
-  // session (stable affinity key) and sends only the new turn (incrementalPrompt). The
-  // bridge re-feeds nothing while the agent is still cached and falls back to the full
-  // prompt if it was evicted, so context is never lost. A transparent retry (attempt >= 1)
-  // uses a FRESH session + the full prompt, so a transient bridge stall ("run timed out")
-  // self-recovers instead of surfacing to the client.
-  const baseSessionKey = sessionAffinity(request);
+  // Maintain one SDK agent per client conversation "under the hood": attempt 0 reuses the
+  // session (affinity header or conversation fingerprint) and sends only the new turn
+  // (incrementalPrompt). The bridge re-feeds nothing while the agent is still cached and
+  // falls back to the full prompt if it was evicted, so context is never lost. A transparent
+  // retry (attempt >= 1) uses a FRESH session + the full prompt, so a transient bridge stall
+  // ("run timed out") self-recovers instead of surfacing to the client.
+  const baseSessionKey = session?.sessionKey || sessionAffinity(request);
   const makeStream = async (attempt: number): Promise<AsyncIterable<CursorTextEvent>> => {
     const completion = await createCursorSdkCompletion(env, deps, apiKey, {
       prompt: prepared.prompt,
       model: prepared.cursorModel,
       sessionKey: attempt === 0 ? baseSessionKey : `retry-${crypto.randomUUID()}`,
       sessionOwnerKey: sdkSessionOwner(apiKey),
-      incrementalPrompt: attempt === 0 ? incrementalPrompt : undefined,
+      incrementalPrompt: attempt === 0 ? session?.incrementalPrompt : undefined,
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
@@ -1036,7 +1092,8 @@ async function handleSdkRoute(
       tools: prepared.tools,
       context: prepared.toolContext,
       onError: onBillingError,
-      onDone: (text, _completionChars, toolCalls) => {
+      onDone: (text, _completionChars, toolCalls, usage) => {
+        session?.remember?.(text, toolCalls);
         if (kind === "responses") {
           storeResponse(
             id,
@@ -1047,7 +1104,8 @@ async function handleSdkRoute(
               text,
               toolCalls,
               promptChars: prepared.promptChars,
-              metadata: prepared.responseMetadata
+              metadata: prepared.responseMetadata,
+              usage
             })
           );
         }
@@ -1062,6 +1120,7 @@ async function handleSdkRoute(
     responseId: id,
     context: prepared.toolContext
   });
+  session?.remember?.(output.text, toolCalls);
 
   if (kind === "chat") {
     return json(
@@ -1072,7 +1131,8 @@ async function handleSdkRoute(
         text: output.text,
         toolCalls,
         promptChars: prepared.promptChars,
-        metadata: prepared.responseMetadata
+        metadata: prepared.responseMetadata,
+        usage: output.usage
       })
     );
   }
@@ -1084,7 +1144,8 @@ async function handleSdkRoute(
     text: output.text,
     toolCalls,
     promptChars: prepared.promptChars,
-    metadata: prepared.responseMetadata
+    metadata: prepared.responseMetadata,
+    usage: output.usage
   });
   storeResponse(id, response);
   return json(response);
@@ -1130,7 +1191,7 @@ interface StreamInput {
   metadata?: Record<string, unknown>;
   tools: OpenAiToolSpec[];
   context?: ToolCallContext;
-  onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[]) => void;
+  onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[], usage?: CursorTokenUsage) => void;
   onError?: (error: unknown) => void | Promise<void>;
 }
 
@@ -1152,6 +1213,7 @@ function streamOpenAiEvents(
     const streamedToolCalls: OpenAiToolCall[] = [];
     let responseNextOutputIndex = 0;
     let responseTextOutputIndex: number | null = null;
+    let usage: CursorTokenUsage | undefined;
     try {
       if (kind === "chat") {
         await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
@@ -1200,6 +1262,7 @@ function streamOpenAiEvents(
         }
         if (event.type === "done") {
           text = event.finalText;
+          usage = event.usage ?? usage;
         }
       }
 
@@ -1213,7 +1276,8 @@ function streamOpenAiEvents(
               created: input.created,
               model: input.model,
               promptChars: input.promptChars,
-              completionChars
+              completionChars,
+              usage
             })
           );
         }
@@ -1231,12 +1295,13 @@ function streamOpenAiEvents(
           text,
           toolCalls: streamedToolCalls,
           textStarted: responseTextOutputIndex !== null,
-          textOutputIndex: responseTextOutputIndex ?? 0
+          textOutputIndex: responseTextOutputIndex ?? 0,
+          usage
         })) {
           await writer.write(event);
         }
       }
-      input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls);
+      input.onDone?.(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls, usage);
     } catch (error) {
       await input.onError?.(error);
       const message = error instanceof Error ? error.message : "Stream failed";

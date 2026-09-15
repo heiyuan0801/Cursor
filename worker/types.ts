@@ -103,6 +103,24 @@ export interface CursorToolCall {
   arguments: Record<string, unknown>;
 }
 
+/**
+ * Billed token counts for one turn, as reported by the Cursor backend (`TokenUsage` in
+ * `@cursor/sdk`). `inputTokens`, `cacheReadTokens`, and `cacheWriteTokens` are disjoint
+ * parts of the prompt: `cacheReadTokens` is the portion served from the SDK's prefix cache,
+ * which OpenAI exposes as `prompt_tokens_details.cached_tokens` and Anthropic as
+ * `cache_read_input_tokens`. Absent whenever the backend did not report usage (legacy
+ * direct-Composer path, turns cut short by a client tool call, older bridges) — callers
+ * fall back to character-based estimates in that case.
+ */
+export interface CursorTokenUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalTokens: number;
+  reasoningTokens?: number;
+}
+
 export interface CursorCompletion {
   requestId: string;
   conversationId: string;

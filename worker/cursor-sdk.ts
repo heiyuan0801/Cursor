@@ -2,7 +2,7 @@ import { sha256Hex } from "./crypto";
 import { exchangeCursorApiKey } from "./cursor";
 import { HttpError } from "./http";
 import type { CursorCollectedOutput, CursorTextEvent } from "./cursor";
-import type { CursorImage, CursorToolCall, Deps, Env } from "./types";
+import type { CursorImage, CursorToolCall, CursorTokenUsage, Deps, Env } from "./types";
 
 interface CursorSdkSession {
   agentId: string;
@@ -21,6 +21,10 @@ interface CursorSdkBridgeOutput {
   agentID?: string;
   runID?: string;
   status?: string;
+  usage?: CursorTokenUsage;
+  /** True when the bridge served this turn from an already-warm agent, meaning the
+   * incremental prompt was used and the SDK prefix cache was eligible to hit. */
+  agentCached?: boolean;
 }
 
 interface ClientToolSpec {
@@ -214,15 +218,17 @@ export async function createCursorSdkCompletion(
 export async function collectCursorSdkOutput(stream: AsyncIterable<CursorTextEvent>): Promise<CursorCollectedOutput> {
   let text = "";
   let toolCalls: CursorToolCall[] = [];
+  let usage: CursorTokenUsage | undefined;
   for await (const event of stream) {
     if (event.type === "text" && event.text) text += event.text;
     if (event.type === "tool_call") toolCalls.push(event.toolCall);
     if (event.type === "done") {
       text = event.finalText;
       toolCalls = event.toolCalls;
+      usage = event.usage ?? usage;
     }
   }
-  return { text, toolCalls };
+  return { text, toolCalls, usage };
 }
 
 export function resetCursorSdkSessionCacheForTest() {
@@ -406,6 +412,7 @@ async function* streamCursorLocalSdkBridgeRun(
   const text = typeof output.text === "string" ? output.text : "";
   const toolCalls: CursorToolCall[] = [];
   const rawToolCalls = Array.isArray(output.toolCalls) ? output.toolCalls : [];
+  const usage = output.usage;
 
   if (text) yield { type: "text", text };
 
@@ -419,16 +426,16 @@ async function* streamCursorLocalSdkBridgeRun(
     const decision = input.allowToolCall?.(toolCall) ?? true;
     if (decision !== true) {
       yield { type: "rejected_tool_call", toolCall, reason: typeof decision === "string" ? decision : undefined };
-      yield { type: "done", finalText: text, toolCalls };
+      yield { type: "done", finalText: text, toolCalls, usage };
       return;
     }
     toolCalls.push(toolCall);
     yield { type: "tool_call", toolCall };
-    yield { type: "done", finalText: text, toolCalls };
+    yield { type: "done", finalText: text, toolCalls, usage };
     return;
   }
 
-  yield { type: "done", finalText: text, toolCalls };
+  yield { type: "done", finalText: text, toolCalls, usage };
 }
 
 async function* streamCursorLocalSdkBridgeRunWithRetry(
@@ -679,7 +686,38 @@ async function parseCursorLocalSdkBridgeJsonResponse(response: Response): Promis
     toolCalls: Array.isArray(object.toolCalls) ? object.toolCalls.flatMap(cursorToolCallFromJson) : [],
     agentID: typeof object.agentID === "string" ? object.agentID : undefined,
     runID: typeof object.runID === "string" ? object.runID : undefined,
-    status: typeof object.status === "string" ? object.status : undefined
+    status: typeof object.status === "string" ? object.status : undefined,
+    usage: cursorTokenUsageFromJson(object.usage),
+    agentCached: object.agentCached === true
+  };
+}
+
+/**
+ * Read the `TokenUsage` a newer bridge attaches to its response. Older bridges omit it, so
+ * every field is validated and the whole thing degrades to undefined rather than reporting
+ * zeroed-out token counts as if they were real.
+ */
+export function cursorTokenUsageFromJson(value: unknown): CursorTokenUsage | undefined {
+  if (!isRecord(value)) return undefined;
+  const count = (field: unknown): number => {
+    const numeric = Number(field);
+    return Number.isFinite(numeric) && numeric > 0 ? Math.floor(numeric) : 0;
+  };
+  const inputTokens = count(value.inputTokens);
+  const outputTokens = count(value.outputTokens);
+  const cacheReadTokens = count(value.cacheReadTokens);
+  const cacheWriteTokens = count(value.cacheWriteTokens);
+  const reasoningTokens = count(value.reasoningTokens);
+  const reportedTotal = count(value.totalTokens);
+  const totalTokens = reportedTotal || inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  if (totalTokens === 0) return undefined;
+  return {
+    inputTokens,
+    outputTokens,
+    cacheReadTokens,
+    cacheWriteTokens,
+    totalTokens,
+    ...(reasoningTokens ? { reasoningTokens } : {})
   };
 }
 

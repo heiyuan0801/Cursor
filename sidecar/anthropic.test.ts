@@ -8,7 +8,8 @@ import {
   estimateTokens,
   flattenToolResultContent,
   mapModel,
-  mapToolChoice
+  mapToolChoice,
+  toolCallsForSessionFingerprint
 } from "./anthropic";
 import type { CursorTextEvent } from "../worker/cursor";
 
@@ -183,6 +184,41 @@ describe("anthropicMessage", () => {
     });
     expect(msg.stop_reason).toBe("tool_use");
   });
+
+  test("reports Cursor's cache buckets as Anthropic cache usage fields", () => {
+    const msg = anthropicMessage({
+      id: "msg_4",
+      model: "m",
+      text: "hi",
+      toolCalls: [],
+      inputTokens: 5,
+      outputTokens: 2,
+      usage: {
+        inputTokens: 130,
+        outputTokens: 44,
+        cacheReadTokens: 9000,
+        cacheWriteTokens: 250,
+        totalTokens: 9424
+      }
+    });
+
+    expect(msg.usage).toEqual({
+      input_tokens: 130,
+      cache_creation_input_tokens: 250,
+      cache_read_input_tokens: 9000,
+      output_tokens: 44
+    });
+  });
+
+  test("falls back to estimates with zeroed cache fields when usage is unavailable", () => {
+    const msg = anthropicMessage({ id: "msg_5", model: "m", text: "hi", toolCalls: [], inputTokens: 5, outputTokens: 2 });
+    expect(msg.usage).toEqual({
+      input_tokens: 5,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: 2
+    });
+  });
 });
 
 async function* events(...evts: CursorTextEvent[]): AsyncGenerator<CursorTextEvent> {
@@ -229,5 +265,85 @@ describe("anthropicSseEvents", () => {
     const toolDelta = out[5].data as any;
     expect(toolDelta.delta).toEqual({ type: "input_json_delta", partial_json: JSON.stringify({ path: "x" }) });
     expect((out[7].data as any).delta.stop_reason).toBe("tool_use");
+  });
+
+  test("corrects the opening estimate with the real usage in message_delta", async () => {
+    const out = await collect(anthropicSseEvents({
+      id: "msg_3",
+      model: "m",
+      inputTokens: 3,
+      stream: events(
+        { type: "text", text: "Hi" },
+        {
+          type: "done",
+          finalText: "Hi",
+          toolCalls: [],
+          usage: {
+            inputTokens: 90,
+            outputTokens: 12,
+            cacheReadTokens: 7000,
+            cacheWriteTokens: 0,
+            totalTokens: 7102
+          }
+        }
+      )
+    }));
+
+    const messageStart = out[0].data as any;
+    expect(messageStart.message.usage).toMatchObject({ input_tokens: 3, cache_read_input_tokens: 0 });
+    expect((out.at(-2)!.data as any).usage).toEqual({
+      input_tokens: 90,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 7000,
+      output_tokens: 12
+    });
+  });
+
+  test("hands the completed turn back so the session can be remembered", async () => {
+    let remembered: { text: string; toolCalls: Array<{ function: { name: string; arguments: string } }> } | undefined;
+    await collect(anthropicSseEvents({
+      id: "msg_6",
+      model: "m",
+      inputTokens: 1,
+      stream: events(
+        { type: "text", text: "done" },
+        { type: "tool_call", toolCall: { name: "read", arguments: { path: "x" } } },
+        { type: "done", finalText: "done", toolCalls: [] }
+      ),
+      onDone: (text, blocks) => {
+        remembered = { text, toolCalls: toolCallsForSessionFingerprint(blocks) };
+      }
+    }));
+
+    // Claude Code replays these as assistant tool_use blocks next turn, so the fingerprint
+    // has to include them or a tool loop never resumes its session.
+    expect(remembered).toEqual({
+      text: "done",
+      toolCalls: [{ function: { name: "read", arguments: JSON.stringify({ path: "x" }) } }]
+    });
+  });
+});
+
+describe("toolCallsForSessionFingerprint", () => {
+  test("matches the shape anthropicToChatBody produces for a replayed tool_use", () => {
+    const message = anthropicMessage({
+      id: "msg_7",
+      model: "m",
+      text: "",
+      toolCalls: [{ name: "read", arguments: { path: "a.ts" } }],
+      inputTokens: 1,
+      outputTokens: 1
+    });
+    const fingerprintCalls = toolCallsForSessionFingerprint(message.content as any[]);
+
+    const replayed = anthropicToChatBody({
+      model: "m",
+      messages: [{ role: "assistant", content: message.content }]
+    });
+    const replayedCalls = (replayed.messages as any[])[0].tool_calls as any[];
+
+    expect(fingerprintCalls).toEqual(
+      replayedCalls.map((call) => ({ function: { name: call.function.name, arguments: call.function.arguments } }))
+    );
   });
 });

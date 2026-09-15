@@ -1941,6 +1941,97 @@ describe("OpenAI compatibility adapter", () => {
     expect(chunk).toContain('"total_usd"');
   });
 
+  it("reports Cursor's real token counts, folding the cache buckets into prompt_tokens", () => {
+    const chat = chatCompletionResponse({
+      id: "chatcmpl_test",
+      created: 1,
+      model: "composer-2.5",
+      text: "hello",
+      promptChars: 20,
+      usage: {
+        inputTokens: 120,
+        outputTokens: 40,
+        cacheReadTokens: 8000,
+        cacheWriteTokens: 300,
+        totalTokens: 8460,
+        reasoningTokens: 12
+      }
+    });
+
+    expect(chat.usage).toMatchObject({
+      prompt_tokens: 8420,
+      completion_tokens: 40,
+      total_tokens: 8460,
+      prompt_tokens_details: { cached_tokens: 8000, cache_creation_tokens: 300 },
+      completion_tokens_details: { reasoning_tokens: 12 }
+    });
+    expect(chat.usage).not.toHaveProperty("estimated");
+  });
+
+  it("marks usage as estimated and reports no cache activity without real counts", () => {
+    const chat = chatCompletionResponse({
+      id: "chatcmpl_test",
+      created: 1,
+      model: "composer-2.5",
+      text: "hello",
+      promptChars: 20
+    });
+
+    expect(chat.usage).toMatchObject({
+      estimated: true,
+      prompt_tokens_details: { cached_tokens: 0 }
+    });
+  });
+
+  it("carries cached token counts into the streamed usage chunk", () => {
+    const chunk = new TextDecoder().decode(
+      chatUsageChunk({
+        id: "chatcmpl_test",
+        created: 1,
+        model: "composer-2.5",
+        promptChars: 20,
+        completionChars: 5,
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadTokens: 900,
+          cacheWriteTokens: 0,
+          totalTokens: 915
+        }
+      })
+    );
+
+    expect(JSON.parse(chunk.slice("data: ".length)).usage).toMatchObject({
+      prompt_tokens: 910,
+      completion_tokens: 5,
+      prompt_tokens_details: { cached_tokens: 900 }
+    });
+  });
+
+  it("reports Responses API usage with cached input tokens", () => {
+    const response = responseObject({
+      id: "resp_test",
+      created: 1,
+      model: "composer-2.5",
+      text: "hello",
+      promptChars: 20,
+      usage: {
+        inputTokens: 50,
+        outputTokens: 20,
+        cacheReadTokens: 400,
+        cacheWriteTokens: 10,
+        totalTokens: 480
+      }
+    });
+
+    expect(response.usage).toMatchObject({
+      input_tokens: 460,
+      output_tokens: 20,
+      total_tokens: 480,
+      input_tokens_details: { cached_tokens: 400, cache_creation_tokens: 10 }
+    });
+  });
+
   it("returns OpenAI-shaped tool call responses", () => {
     const toolCalls = toOpenAiToolCalls({
       responseId: "chatcmpl_test",

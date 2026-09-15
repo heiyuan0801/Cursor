@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { resetChatSessionCacheForTest } from "./chat-session";
 import { resetCursorSdkSessionCacheForTest } from "./cursor-sdk";
 import { handleRequest } from "./index";
 import { resetModelRouterStateForTest } from "./model-router";
@@ -1235,6 +1236,106 @@ describe("Worker", () => {
       apiKey: "cursor_direct_key_chat_sdk",
       model: "composer-2.5"
     });
+  });
+
+  it("reuses one SDK session across chat turns and reports the cache hit", async () => {
+    // The scenario from https://github.com/NGLSG/Cursor2API/issues/1: a relay such as New API
+    // sends plain OpenAI requests with no affinity header, replaying the whole transcript
+    // each turn. The second turn must land on the same agent, carry only the new message,
+    // and surface the backend's cache read as prompt_tokens_details.cached_tokens.
+    resetCursorSdkSessionCacheForTest();
+    resetChatSessionCacheForTest();
+    const db = new FakeD1();
+    const env = { ...makeEnv(db), CURSOR_SDK_BRIDGE_URL: "https://bridge.test/sdk" };
+    const bridgeBodies: Array<Record<string, unknown>> = [];
+    let uuid = 0;
+    const deps: Deps = {
+      now: () => new Date("2026-08-19T00:00:00.000Z"),
+      randomUUID: () => `00000000-0000-4000-8000-${String(++uuid).padStart(12, "0")}`,
+      fetch: async (input, init) => {
+        const url = new URL(String(input));
+        if (url.hostname === "bridge.test") {
+          bridgeBodies.push(JSON.parse(String(init?.body || "{}")));
+          return Response.json({
+            text: "Hello",
+            toolCalls: [],
+            agentID: "agent-test",
+            runID: "run-test",
+            status: "completed",
+            usage: {
+              inputTokens: 40,
+              outputTokens: 10,
+              cacheReadTokens: bridgeBodies.length > 1 ? 7000 : 0,
+              cacheWriteTokens: bridgeBodies.length > 1 ? 0 : 7000,
+              totalTokens: bridgeBodies.length > 1 ? 7050 : 7050
+            }
+          });
+        }
+        return Response.json({ items: [{ id: "composer-2.5", displayName: "Composer 2.5", aliases: ["default"] }] });
+      }
+    };
+
+    const ask = (messages: unknown[]) =>
+      handleRequest(
+        new Request("https://composer.test/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer cursor_relay_key" },
+          body: JSON.stringify({ model: "composer-2.5", messages })
+        }),
+        env,
+        fakeCtx(),
+        deps
+      );
+
+    const firstBody = (await (await ask([{ role: "user", content: "Say hello" }])).json()) as any;
+    expect(firstBody.usage).toMatchObject({
+      prompt_tokens: 7040,
+      prompt_tokens_details: { cached_tokens: 0, cache_creation_tokens: 7000 }
+    });
+
+    const secondBody = (await (
+      await ask([
+        { role: "user", content: "Say hello" },
+        { role: "assistant", content: "Hello" },
+        { role: "user", content: "And again" }
+      ])
+    ).json()) as any;
+
+    expect(bridgeBodies).toHaveLength(2);
+    expect(bridgeBodies[1].sessionKey).toBe(bridgeBodies[0].sessionKey);
+    expect(String(bridgeBodies[1].incrementalPrompt)).toContain("And again");
+    expect(String(bridgeBodies[1].incrementalPrompt)).not.toContain("Say hello");
+    expect(secondBody.usage).toMatchObject({
+      prompt_tokens: 7040,
+      prompt_tokens_details: { cached_tokens: 7000 }
+    });
+  });
+
+  it("keeps unrelated chat conversations on separate SDK sessions", async () => {
+    resetCursorSdkSessionCacheForTest();
+    resetChatSessionCacheForTest();
+    const db = new FakeD1();
+    const env = { ...makeEnv(db), CURSOR_SDK_BRIDGE_URL: "https://bridge.test/sdk" };
+    const { deps, sdkRequests } = fakeDeps();
+
+    const ask = (content: string) =>
+      handleRequest(
+        new Request("https://composer.test/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", Authorization: "Bearer cursor_relay_key_two" },
+          body: JSON.stringify({ model: "composer-2.5", messages: [{ role: "user", content }] })
+        }),
+        env,
+        fakeCtx(),
+        deps
+      );
+
+    await ask("First conversation");
+    await ask("Unrelated second conversation");
+
+    const [first, second] = sdkRequests.map((item) => (item.body as { sessionKey?: string }).sessionKey);
+    expect(first).toBeTruthy();
+    expect(second).not.toBe(first);
   });
 
   it("reuses the SDK session for standard Responses continuations", async () => {
