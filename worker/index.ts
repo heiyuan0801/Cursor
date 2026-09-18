@@ -32,6 +32,7 @@ import {
   toolCallRetryHint,
   toOpenAiToolCalls
 } from "./openai";
+import { calculateCost, estimateCostFromChars } from "./pricing";
 import { submitWaitlist } from "./waitlist";
 import { encodeSse } from "./sse";
 import {
@@ -54,6 +55,7 @@ import {
   routeCandidates,
   type RoutedCredential
 } from "./model-router";
+import { getRequestLogs, getUsageStatistics } from "./analytics";
 
 export { CursorSdkBridgeContainer } from "./sdk-bridge-container";
 
@@ -101,6 +103,12 @@ export async function handleRequest(request: Request, env: Env, ctx: ExecutionCo
     }
     if (url.pathname === "/api/early-access" && request.method === "POST") {
       return await handleEarlyAccess(request, env, deps);
+    }
+    if (url.pathname === "/api/usage" && request.method === "GET") {
+      return await handleUsageStats(request, env);
+    }
+    if (url.pathname === "/api/logs" && request.method === "GET") {
+      return await handleRequestLogs(request, env);
     }
     if (url.pathname === "/api/credentials" || url.pathname.startsWith("/api/credentials/")) {
       return await handleCredentialRoute(request, env, deps, url);
@@ -366,6 +374,52 @@ async function handleEarlyAccess(request: Request, env: Env, deps: Deps): Promis
   return json({ ok: true });
 }
 
+async function handleUsageStats(request: Request, env: Env): Promise<Response> {
+  const token = bearerToken(request);
+  if (!token?.startsWith("cmp_")) return unauthorized();
+  const auth = await authenticateProxyKey(env, token);
+  if (!auth) return unauthorized();
+
+  const url = new URL(request.url);
+  const startDate = url.searchParams.get("start_date") || undefined;
+  const endDate = url.searchParams.get("end_date") || undefined;
+  const model = url.searchParams.get("model") || undefined;
+
+  const stats = await getUsageStatistics(env, auth.account.id, {
+    startDate,
+    endDate,
+    model
+  });
+
+  return json(stats);
+}
+
+async function handleRequestLogs(request: Request, env: Env): Promise<Response> {
+  const token = bearerToken(request);
+  if (!token?.startsWith("cmp_")) return unauthorized();
+  const auth = await authenticateProxyKey(env, token);
+  if (!auth) return unauthorized();
+
+  const url = new URL(request.url);
+  const limit = parseInt(url.searchParams.get("limit") || "100", 10);
+  const offset = parseInt(url.searchParams.get("offset") || "0", 10);
+  const startDate = url.searchParams.get("start_date") || undefined;
+  const endDate = url.searchParams.get("end_date") || undefined;
+  const model = url.searchParams.get("model") || undefined;
+  const status = url.searchParams.get("status") || undefined;
+
+  const logs = await getRequestLogs(env, auth.account.id, {
+    limit,
+    offset,
+    startDate,
+    endDate,
+    model,
+    status
+  });
+
+  return json({ data: logs });
+}
+
 async function handleSignup(request: Request, env: Env, ctx: ExecutionContext, deps: Deps): Promise<Response> {
   const body = await parseJsonBody<Record<string, unknown>>(request);
   const cursorApiKey = typeof body.cursorApiKey === "string" ? body.cursorApiKey.trim() : "";
@@ -593,11 +647,30 @@ async function handleOpenAiCompletion(
           endpoint: route.kind,
           model: prepared.model,
           status: "running",
-          promptChars: prepared.promptChars
+          promptChars: prepared.promptChars,
+          requestId: completionRoute.kind === "responses" ? id : undefined,
+          conversationId: undefined
         })
       : null;
-  const finishLog = (input: Parameters<typeof completeRequestLog>[2]): Promise<void> =>
-    logId ? completeRequestLog(env, logId, input) : Promise.resolve();
+  const startTime = deps.now().getTime();
+  const finishLog = (input: Parameters<typeof completeRequestLog>[2]): Promise<void> => {
+    if (!logId) return Promise.resolve();
+
+    const durationMs = deps.now().getTime() - startTime;
+    const costs = input.usage
+      ? calculateCost(prepared.model, input.usage)
+      : estimateCostFromChars(prepared.model, prepared.promptChars, input.completionChars || 0);
+
+    return completeRequestLog(env, logId, {
+      ...input,
+      durationMs,
+      inputCost: costs.inputCost,
+      outputCost: costs.outputCost,
+      cacheReadCost: costs.cacheReadCost,
+      cacheWriteCost: costs.cacheWriteCost,
+      totalCost: costs.totalCost
+    });
+  };
 
   try {
     if (shouldUseSdkForPreparedRoute(env, completionRoute)) {
@@ -659,7 +732,8 @@ async function handleOpenAiCompletion(
           }
           return finishLog({
             status: "completed",
-            completionChars
+            completionChars,
+            usage
           });
         },
         onError: (error) =>
@@ -680,7 +754,8 @@ async function handleOpenAiCompletion(
     const completionChars = completionCharsFromOutput(output.text, toolCalls);
     await finishLog({
       status: "completed",
-      completionChars
+      completionChars,
+      usage: output.usage
     });
     if (route.kind === "chat") {
       return json(
@@ -963,8 +1038,25 @@ async function handleOpenCodeSdkChatRoute(
           promptChars: prepared.promptChars
         })
       : null;
-  const finishLog = (input: Parameters<typeof completeRequestLog>[2]): Promise<void> =>
-    logId ? completeRequestLog(env, logId, input) : Promise.resolve();
+  const startTime = deps.now().getTime();
+  const finishLog = (input: Parameters<typeof completeRequestLog>[2]): Promise<void> => {
+    if (!logId) return Promise.resolve();
+
+    const durationMs = deps.now().getTime() - startTime;
+    const costs = input.usage
+      ? calculateCost(prepared.model, input.usage)
+      : estimateCostFromChars(prepared.model, prepared.promptChars, input.completionChars || 0);
+
+    return completeRequestLog(env, logId, {
+      ...input,
+      durationMs,
+      inputCost: costs.inputCost,
+      outputCost: costs.outputCost,
+      cacheReadCost: costs.cacheReadCost,
+      cacheWriteCost: costs.cacheWriteCost,
+      totalCost: costs.totalCost
+    });
+  };
 
   try {
     const completion = await createCursorSdkCompletion(env, deps, auth.cursorApiKey, {
@@ -998,12 +1090,13 @@ async function handleOpenCodeSdkChatRoute(
         tools: prepared.tools,
         context: prepared.toolContext,
         onBillingError,
-        onDone: (_text, completionChars) =>
+        onDone: (_text, completionChars, _toolCalls, usage) =>
           finishLog({
             status: "completed",
             completionChars,
             cursorAgentId: completion.agentId,
-            cursorRunId: completion.runId
+            cursorRunId: completion.runId,
+            usage
           }),
         onError: (error) =>
           finishLog({
@@ -1027,7 +1120,8 @@ async function handleOpenCodeSdkChatRoute(
       status: "completed",
       completionChars,
       cursorAgentId: completion.agentId,
-      cursorRunId: completion.runId
+      cursorRunId: completion.runId,
+      usage: output.usage
     });
     return json(
       chatCompletionResponse({
@@ -1097,7 +1191,8 @@ function streamOpenAiEvents(
     ) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   },
-  ctx: ExecutionContext
+  ctx: ExecutionContext,
+  startTime?: number
 ): Response {
   const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
   const writer = writable.getWriter();
@@ -1109,6 +1204,9 @@ function streamOpenAiEvents(
     let responseNextOutputIndex = 0;
     let responseTextOutputIndex: number | null = null;
     let usage: CursorTokenUsage | undefined;
+    let firstTokenTime: number | undefined;
+    const requestStartTime = startTime || Date.now();
+
     try {
       if (kind === "chat") {
         await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, role: "assistant" }));
@@ -1117,6 +1215,11 @@ function streamOpenAiEvents(
       }
 
       for await (const event of cursorEvents) {
+        // 记录首次token时间
+        if (!firstTokenTime && (event.type === "text" || event.type === "tool_call")) {
+          firstTokenTime = Date.now();
+        }
+
         if (event.type === "text" && event.text) {
           text += event.text;
           if (kind === "chat") await writer.write(chatChunk({ id: input.id, created: input.created, model: input.model, delta: event.text }));
@@ -1185,7 +1288,10 @@ function streamOpenAiEvents(
           usage
         })) await writer.write(event);
       }
-      await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls, usage);
+
+      // 计算首次token延迟
+      const firstTokenMs = firstTokenTime ? firstTokenTime - requestStartTime : undefined;
+      await input.onDone(text, completionCharsFromOutput(text, streamedToolCalls), streamedToolCalls, usage, firstTokenMs);
     } catch (error) {
       if (input.onBillingError && isBillingError(error)) {
         await input.onBillingError(error).catch(() => undefined);

@@ -6,6 +6,7 @@ import type {
   CursorCredentialModelRow,
   CursorCredentialRow,
   CursorMe,
+  CursorTokenUsage,
   Env
 } from "./types";
 
@@ -229,14 +230,18 @@ export async function createRequestLog(
     cursorRunId?: string;
     error?: string;
     completedAt?: string;
+    requestId?: string;
+    conversationId?: string;
   }
 ): Promise<string> {
   const id = `req_${crypto.randomUUID()}`;
+  const now = new Date().toISOString();
   await env.DB.prepare(
     `INSERT INTO request_logs (
       id, account_id, endpoint, model, cursor_agent_id, cursor_run_id, status,
-      prompt_chars, completion_chars, error, created_at, completed_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      prompt_chars, completion_chars, error, created_at, completed_at,
+      request_id, conversation_id
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   )
     .bind(
       id,
@@ -249,8 +254,10 @@ export async function createRequestLog(
       input.promptChars ?? 0,
       input.completionChars ?? 0,
       input.error ?? null,
-      new Date().toISOString(),
-      input.completedAt ?? null
+      now,
+      input.completedAt ?? null,
+      input.requestId ?? null,
+      input.conversationId ?? null
     )
     .run();
   return id;
@@ -259,12 +266,41 @@ export async function createRequestLog(
 export async function completeRequestLog(
   env: Env,
   id: string,
-  input: { status: string; completionChars?: number; cursorAgentId?: string; cursorRunId?: string; error?: string }
+  input: {
+    status: string;
+    completionChars?: number;
+    cursorAgentId?: string;
+    cursorRunId?: string;
+    error?: string;
+    usage?: CursorTokenUsage;
+    inputCost?: number;
+    outputCost?: number;
+    cacheReadCost?: number;
+    cacheWriteCost?: number;
+    totalCost?: number;
+    durationMs?: number;
+    firstTokenMs?: number;
+  }
 ): Promise<void> {
+  const now = new Date().toISOString();
+
+  // 计算缓存命中率
+  let cacheHitRate = 0;
+  if (input.usage) {
+    const totalInputTokens = input.usage.inputTokens + input.usage.cacheReadTokens + input.usage.cacheWriteTokens;
+    if (totalInputTokens > 0) {
+      cacheHitRate = input.usage.cacheReadTokens / totalInputTokens;
+    }
+  }
+
   await env.DB.prepare(
     `UPDATE request_logs
      SET status = ?, completion_chars = ?, cursor_agent_id = COALESCE(?, cursor_agent_id),
-         cursor_run_id = COALESCE(?, cursor_run_id), error = ?, completed_at = ?
+         cursor_run_id = COALESCE(?, cursor_run_id), error = ?, completed_at = ?,
+         input_tokens = ?, output_tokens = ?, cache_read_tokens = ?, cache_write_tokens = ?,
+         total_tokens = ?, reasoning_tokens = ?,
+         input_cost = ?, output_cost = ?, cache_read_cost = ?, cache_write_cost = ?,
+         total_cost = ?, duration_ms = ?, first_token_ms = ?, cache_hit_rate = ?
      WHERE id = ?`
   )
     .bind(
@@ -273,7 +309,21 @@ export async function completeRequestLog(
       input.cursorAgentId ?? null,
       input.cursorRunId ?? null,
       input.error ?? null,
-      new Date().toISOString(),
+      now,
+      input.usage?.inputTokens ?? 0,
+      input.usage?.outputTokens ?? 0,
+      input.usage?.cacheReadTokens ?? 0,
+      input.usage?.cacheWriteTokens ?? 0,
+      input.usage?.totalTokens ?? 0,
+      input.usage?.reasoningTokens ?? 0,
+      input.inputCost ?? 0,
+      input.outputCost ?? 0,
+      input.cacheReadCost ?? 0,
+      input.cacheWriteCost ?? 0,
+      input.totalCost ?? 0,
+      input.durationMs ?? null,
+      input.firstTokenMs ?? null,
+      cacheHitRate,
       id
     )
     .run();

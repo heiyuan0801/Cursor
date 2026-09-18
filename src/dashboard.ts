@@ -3,6 +3,25 @@ import { escapeHtml, icon, hydrateIcons } from "./ui";
 interface Credential { id: string; label: string; hint: string; status: "active" | "disabled"; models: string[]; }
 interface ClientKey { id: string; label: string; hint: string; createdAt: string; }
 interface Settings { publicBaseUrl: string; baseUrl: string; }
+interface UsageStats {
+  totalRequests: number;
+  completedRequests: number;
+  failedRequests: number;
+  totalTokens: number;
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
+  totalCost: number;
+  inputCost: number;
+  outputCost: number;
+  cacheReadCost: number;
+  cacheWriteCost: number;
+  averageDurationMs: number | null;
+  averageFirstTokenMs: number | null;
+  averageCacheHitRate: number;
+  modelBreakdown: Array<{ model: string; requests: number; totalCost: number; totalTokens: number; }>;
+}
 
 async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(path, { credentials: "same-origin", ...init, headers: { "content-type": "application/json", ...(init.headers || {}) } });
@@ -45,12 +64,22 @@ function mountConsole(root: HTMLElement): void {
   let credentials: Credential[] = [];
   let clientKeys: ClientKey[] = [];
   let settings: Settings = { publicBaseUrl: "", baseUrl: window.location.origin + "/v1" };
+  let usageStats: UsageStats | null = null;
   const notice = (message: string, error = false): void => { const el = root.querySelector<HTMLElement>("#dashboard-notice"); if (!el) return; el.hidden = !message; el.textContent = message; el.classList.toggle("error", error); };
   const refresh = async (): Promise<void> => {
     try {
-      const [accounts, keys, nextSettings] = await Promise.all([requestJson<{ data?: Credential[] }>("/api/credentials"), requestJson<{ data?: ClientKey[] }>("/api/keys"), requestJson<Settings>("/api/settings")]);
-      credentials = accounts.data || []; clientKeys = keys.data || []; settings = nextSettings;
-      renderConsole(root, credentials, clientKeys, settings, refresh, notice); notice("");
+      const [accounts, keys, nextSettings, stats] = await Promise.all([
+        requestJson<{ data?: Credential[] }>("/api/credentials"),
+        requestJson<{ data?: ClientKey[] }>("/api/keys"),
+        requestJson<Settings>("/api/settings"),
+        requestJson<UsageStats>("/api/usage").catch(() => null)
+      ]);
+      credentials = accounts.data || [];
+      clientKeys = keys.data || [];
+      settings = nextSettings;
+      usageStats = stats;
+      renderConsole(root, credentials, clientKeys, settings, usageStats, refresh, notice);
+      notice("");
     } catch (error) {
       const message = error instanceof Error ? error.message : "加载失败";
       if (/401|unauthor/i.test(message)) { void boot(root); return; }
@@ -89,20 +118,82 @@ function mountConsole(root: HTMLElement): void {
 
 function consoleMarkup(): string {
   const copy = icon("Copy", { width: 16, height: 16 });
-  return "<div class=\"dashboard-shell\"><header class=\"dashboard-header\"><a class=\"brand\" href=\"/\"><img class=\"brand-icon\" src=\"/api-for-cursor-icon.png\" width=\"36\" height=\"36\" alt=\"\"/><span class=\"brand-text\">Cursor Gateway</span></a><div class=\"dashboard-header-right\"><span class=\"dashboard-product\">Control Console</span><button class=\"icon-button\" id=\"logout\" title=\"退出登录\" aria-label=\"退出登录\">" + icon("LogOut", { width: 16, height: 16 }) + "</button></div></header><main class=\"dashboard-main\"><div class=\"dashboard-toolbar\"><div><p class=\"dashboard-kicker\">OPERATIONS</p><h1>网关控制台</h1><p class=\"dashboard-subtitle\">管理 Cursor 账号池、客户端密钥和对外接入地址。</p></div><div class=\"toolbar-actions\"><button class=\"icon-button\" id=\"refresh-all\" title=\"刷新数据\" aria-label=\"刷新数据\">" + icon("RefreshCw", { width: 17, height: 17 }) + "</button><button class=\"btn btn-primary\" id=\"add-account\" type=\"button\">" + icon("Plus", { width: 16, height: 16 }) + " 添加账号</button></div></div><section class=\"dashboard-summary\"><div class=\"summary-item\"><span>账号</span><strong id=\"account-count\">0</strong></div><div class=\"summary-item\"><span>可用</span><strong id=\"healthy-count\">0</strong></div><div class=\"summary-item\"><span>共同模型</span><strong id=\"model-count\">0</strong></div><div class=\"summary-item\"><span>客户端 Key</span><strong id=\"client-key-count\">0</strong></div></section><section class=\"dashboard-section connection-section\"><div class=\"section-bar\"><div><h2>客户端接入</h2><p class=\"section-note\">客户端使用后台创建的独立 <code>sk-...</code> Key，不会接触 Cursor 凭据。</p></div></div><div class=\"connection-grid endpoint-grid\"><label>API Base URL<span class=\"gateway-input\"><input id=\"api-base-url\" readonly/><button class=\"icon-button\" type=\"button\" data-copy-target=\"api-base-url\" title=\"复制 API 地址\" aria-label=\"复制 API 地址\">" + copy + "</button></span></label><label>对外地址<span class=\"endpoint-editor\"><input id=\"public-base-url\" placeholder=\"https://api.example.com\"/><button class=\"btn btn-secondary\" id=\"save-public-url\" type=\"button\">保存</button></span></label></div></section><div id=\"dashboard-notice\" class=\"dashboard-notice\" hidden></div><section class=\"dashboard-section credentials-section\"><div class=\"section-bar\"><div><h2>Cursor 账号</h2><p class=\"section-note\">凭据加密存储；账单错误会自动停用对应模型并切换账号。</p></div><button class=\"btn btn-secondary\" id=\"import-accounts\" type=\"button\">批量导入</button></div><div class=\"credential-table-head\"><span>账号</span><span>模型</span><span>状态</span><span></span></div><div id=\"account-list\"></div></section><section class=\"dashboard-section client-keys-section\"><div class=\"section-bar\"><div><h2>客户端 API Keys</h2><p class=\"section-note\">Key 仅在创建时显示一次，撤销后立即失效。</p></div><button class=\"btn btn-primary\" id=\"create-client-key\" type=\"button\">" + icon("KeyRound", { width: 16, height: 16 }) + " 创建 Key</button></div><div class=\"client-key-head\"><span>名称</span><span>密钥标识</span><span>创建时间</span><span></span></div><div id=\"client-key-list\"></div></section></main><dialog id=\"account-dialog\"><form id=\"account-form\"><h2>添加 Cursor 账号</h2><p class=\"section-note account-key-guide\">从 <a href=\"https://cursor.com/dashboard\" target=\"_blank\" rel=\"noreferrer\">cursor.com/dashboard</a> 左侧打开 API KEY，点击新建后复制页面显示的 <code>crsr_...</code> 密钥。</p><label>名称<input id=\"account-label\" placeholder=\"例如：工作账号\"/></label><label>Cursor API Key<textarea id=\"account-value\" rows=\"7\" placeholder=\"支持多行；批量格式为 名称,Key\"></textarea></label><div class=\"dialog-actions\"><button class=\"btn btn-secondary\" id=\"cancel-account\" type=\"button\">取消</button><button class=\"btn btn-primary\" type=\"submit\">保存并校验</button></div></form></dialog><dialog id=\"client-key-dialog\"><form id=\"client-key-form\"><div id=\"client-key-fields\"><h2>创建客户端 API Key</h2><label>名称<input id=\"client-key-label\" placeholder=\"例如：OpenCode 本机\" required/></label><div class=\"dialog-actions\"><button class=\"btn btn-secondary\" id=\"cancel-client-key\" type=\"button\">取消</button><button class=\"btn btn-primary\" type=\"submit\">创建 Key</button></div></div><div id=\"client-key-result\" hidden><h2>保存此 API Key</h2><p class=\"section-note\">关闭窗口后不能再次查看完整 Key。</p><span class=\"gateway-input\"><input id=\"new-client-key\" readonly/><button class=\"icon-button\" type=\"button\" data-copy-target=\"new-client-key\" title=\"复制 API Key\" aria-label=\"复制 API Key\">" + copy + "</button></span><div class=\"dialog-actions\"><button class=\"btn btn-primary\" id=\"close-client-key\" type=\"button\">完成</button></div></div></form></dialog></div>";
+  return "<div class=\"dashboard-shell\"><header class=\"dashboard-header\"><a class=\"brand\" href=\"/\"><img class=\"brand-icon\" src=\"/api-for-cursor-icon.png\" width=\"36\" height=\"36\" alt=\"\"/><span class=\"brand-text\">Cursor Gateway</span></a><div class=\"dashboard-header-right\"><span class=\"dashboard-product\">Control Console</span><button class=\"icon-button\" id=\"logout\" title=\"退出登录\" aria-label=\"退出登录\">" + icon("LogOut", { width: 16, height: 16 }) + "</button></div></header><main class=\"dashboard-main\"><div class=\"dashboard-toolbar\"><div><p class=\"dashboard-kicker\">OPERATIONS</p><h1>网关控制台</h1><p class=\"dashboard-subtitle\">管理 Cursor 账号池、客户端密钥和对外接入地址。</p></div><div class=\"toolbar-actions\"><button class=\"icon-button\" id=\"refresh-all\" title=\"刷新数据\" aria-label=\"刷新数据\">" + icon("RefreshCw", { width: 17, height: 17 }) + "</button><button class=\"btn btn-primary\" id=\"add-account\" type=\"button\">" + icon("Plus", { width: 16, height: 16 }) + " 添加账号</button></div></div><section class=\"dashboard-summary\"><div class=\"summary-item\"><span>账号</span><strong id=\"account-count\">0</strong></div><div class=\"summary-item\"><span>可用</span><strong id=\"healthy-count\">0</strong></div><div class=\"summary-item\"><span>共同模型</span><strong id=\"model-count\">0</strong></div><div class=\"summary-item\"><span>客户端 Key</span><strong id=\"client-key-count\">0</strong></div></section><section class=\"dashboard-section usage-section\"><div class=\"section-bar\"><div><h2>使用统计</h2><p class=\"section-note\">实时 API 调用统计和费用分析。</p></div></div><div class=\"usage-grid\"><div class=\"usage-card\"><div class=\"usage-card-header\"><span class=\"usage-label\">总请求数</span>" + icon("Activity", { width: 16, height: 16 }) + "</div><div class=\"usage-value\" id=\"total-requests\">-</div><div class=\"usage-detail\"><span class=\"usage-success\" id=\"completed-requests\">-</span><span class=\"usage-error\" id=\"failed-requests\">-</span></div></div><div class=\"usage-card\"><div class=\"usage-card-header\"><span class=\"usage-label\">总 Tokens</span>" + icon("Zap", { width: 16, height: 16 }) + "</div><div class=\"usage-value\" id=\"total-tokens\">-</div><div class=\"usage-detail\"><span id=\"token-breakdown\">-</span></div></div><div class=\"usage-card\"><div class=\"usage-card-header\"><span class=\"usage-label\">总花费</span>" + icon("DollarSign", { width: 16, height: 16 }) + "</div><div class=\"usage-value\" id=\"total-cost\">-</div><div class=\"usage-detail\"><span id=\"cost-breakdown\">-</span></div></div><div class=\"usage-card\"><div class=\"usage-card-header\"><span class=\"usage-label\">平均响应</span>" + icon("Clock", { width: 16, height: 16 }) + "</div><div class=\"usage-value\" id=\"avg-duration\">-</div><div class=\"usage-detail\"><span id=\"ttft\">首字: -</span><span id=\"cache-rate\">缓存率: -</span></div></div></div><div id=\"model-breakdown\" class=\"model-breakdown\"></div></section><section class=\"dashboard-section connection-section\"><div class=\"section-bar\"><div><h2>客户端接入</h2><p class=\"section-note\">客户端使用后台创建的独立 <code>sk-...</code> Key，不会接触 Cursor 凭据。</p></div></div><div class=\"connection-grid endpoint-grid\"><label>API Base URL<span class=\"gateway-input\"><input id=\"api-base-url\" readonly/><button class=\"icon-button\" type=\"button\" data-copy-target=\"api-base-url\" title=\"复制 API 地址\" aria-label=\"复制 API 地址\">" + copy + "</button></span></label><label>对外地址<span class=\"endpoint-editor\"><input id=\"public-base-url\" placeholder=\"https://api.example.com\"/><button class=\"btn btn-secondary\" id=\"save-public-url\" type=\"button\">保存</button></span></label></div></section><div id=\"dashboard-notice\" class=\"dashboard-notice\" hidden></div><section class=\"dashboard-section credentials-section\"><div class=\"section-bar\"><div><h2>Cursor 账号</h2><p class=\"section-note\">凭据加密存储；账单错误会自动停用对应模型并切换账号。</p></div><button class=\"btn btn-secondary\" id=\"import-accounts\" type=\"button\">批量导入</button></div><div class=\"credential-table-head\"><span>账号</span><span>模型</span><span>状态</span><span></span></div><div id=\"account-list\"></div></section><section class=\"dashboard-section client-keys-section\"><div class=\"section-bar\"><div><h2>客户端 API Keys</h2><p class=\"section-note\">Key 仅在创建时显示一次，撤销后立即失效。</p></div><button class=\"btn btn-primary\" id=\"create-client-key\" type=\"button\">" + icon("KeyRound", { width: 16, height: 16 }) + " 创建 Key</button></div><div class=\"client-key-head\"><span>名称</span><span>密钥标识</span><span>创建时间</span><span></span></div><div id=\"client-key-list\"></div></section></main><dialog id=\"account-dialog\"><form id=\"account-form\"><h2>添加 Cursor 账号</h2><p class=\"section-note account-key-guide\">从 <a href=\"https://cursor.com/dashboard\" target=\"_blank\" rel=\"noreferrer\">cursor.com/dashboard</a> 左侧打开 API KEY，点击新建后复制页面显示的 <code>crsr_...</code> 密钥。</p><label>名称<input id=\"account-label\" placeholder=\"例如：工作账号\"/></label><label>Cursor API Key<textarea id=\"account-value\" rows=\"7\" placeholder=\"支持多行；批量格式为 名称,Key\"></textarea></label><div class=\"dialog-actions\"><button class=\"btn btn-secondary\" id=\"cancel-account\" type=\"button\">取消</button><button class=\"btn btn-primary\" type=\"submit\">保存并校验</button></div></form></dialog><dialog id=\"client-key-dialog\"><form id=\"client-key-form\"><div id=\"client-key-fields\"><h2>创建客户端 API Key</h2><label>名称<input id=\"client-key-label\" placeholder=\"例如：OpenCode 本机\" required/></label><div class=\"dialog-actions\"><button class=\"btn btn-secondary\" id=\"cancel-client-key\" type=\"button\">取消</button><button class=\"btn btn-primary\" type=\"submit\">创建 Key</button></div></div><div id=\"client-key-result\" hidden><h2>保存此 API Key</h2><p class=\"section-note\">关闭窗口后不能再次查看完整 Key。</p><span class=\"gateway-input\"><input id=\"new-client-key\" readonly/><button class=\"icon-button\" type=\"button\" data-copy-target=\"new-client-key\" title=\"复制 API Key\" aria-label=\"复制 API Key\">" + copy + "</button></span><div class=\"dialog-actions\"><button class=\"btn btn-primary\" id=\"close-client-key\" type=\"button\">完成</button></div></div></form></dialog></div>";
 }
 
-function renderConsole(root: HTMLElement, credentials: Credential[], clientKeys: ClientKey[], settings: Settings, refresh: () => Promise<void>, notice: (message: string, error?: boolean) => void): void {
+function renderConsole(root: HTMLElement, credentials: Credential[], clientKeys: ClientKey[], settings: Settings, usageStats: UsageStats | null, refresh: () => Promise<void>, notice: (message: string, error?: boolean) => void): void {
   const active = credentials.filter((item) => item.status === "active");
   const common = active.length ? active.slice(1).reduce((shared, item) => new Set([...shared].filter((model) => item.models.includes(model))), new Set(active[0].models)) : new Set<string>();
-  root.querySelector("#account-count")!.textContent = String(credentials.length); root.querySelector("#healthy-count")!.textContent = String(active.length); root.querySelector("#model-count")!.textContent = String(common.size); root.querySelector("#client-key-count")!.textContent = String(clientKeys.length);
+  root.querySelector("#account-count")!.textContent = String(credentials.length);
+  root.querySelector("#healthy-count")!.textContent = String(active.length);
+  root.querySelector("#model-count")!.textContent = String(common.size);
+  root.querySelector("#client-key-count")!.textContent = String(clientKeys.length);
+
+  // 渲染使用统计
+  if (usageStats) {
+    const formatNumber = (n: number): string => n.toLocaleString();
+    const formatCost = (n: number): string => "$" + n.toFixed(4);
+    const formatPercent = (n: number): string => (n * 100).toFixed(1) + "%";
+
+    root.querySelector("#total-requests")!.textContent = formatNumber(usageStats.totalRequests);
+    root.querySelector("#completed-requests")!.textContent = "✓ " + formatNumber(usageStats.completedRequests);
+    root.querySelector("#failed-requests")!.textContent = "✗ " + formatNumber(usageStats.failedRequests);
+
+    root.querySelector("#total-tokens")!.textContent = formatNumber(usageStats.totalTokens);
+    root.querySelector("#token-breakdown")!.textContent =
+      "输入: " + formatNumber(usageStats.inputTokens) + " | " +
+      "输出: " + formatNumber(usageStats.outputTokens) + " | " +
+      "缓存: " + formatNumber(usageStats.cacheReadTokens);
+
+    root.querySelector("#total-cost")!.textContent = formatCost(usageStats.totalCost);
+    root.querySelector("#cost-breakdown")!.textContent =
+      "输入: " + formatCost(usageStats.inputCost) + " | " +
+      "输出: " + formatCost(usageStats.outputCost) + " | " +
+      "缓存: " + formatCost(usageStats.cacheReadCost);
+
+    root.querySelector("#avg-duration")!.textContent = usageStats.averageDurationMs
+      ? Math.round(usageStats.averageDurationMs).toString() + "ms"
+      : "-";
+
+    root.querySelector("#ttft")!.textContent = usageStats.averageFirstTokenMs
+      ? "首字: " + Math.round(usageStats.averageFirstTokenMs) + "ms"
+      : "首字: -";
+
+    root.querySelector("#cache-rate")!.textContent = "缓存率: " + formatPercent(usageStats.averageCacheHitRate);
+
+    // 渲染模型分析
+    const modelBreakdown = root.querySelector<HTMLElement>("#model-breakdown")!;
+    if (usageStats.modelBreakdown && usageStats.modelBreakdown.length > 0) {
+      modelBreakdown.innerHTML =
+        "<h3>模型使用明细</h3>" +
+        "<div class=\"model-breakdown-grid\">" +
+        usageStats.modelBreakdown.map((item) =>
+          "<div class=\"model-card\">" +
+          "<div class=\"model-name\">" + escapeHtml(item.model) + "</div>" +
+          "<div class=\"model-stats\">" +
+          "<div><span>请求:</span><strong>" + formatNumber(item.requests) + "</strong></div>" +
+          "<div><span>Token:</span><strong>" + formatNumber(item.totalTokens) + "</strong></div>" +
+          "<div><span>花费:</span><strong>" + formatCost(item.totalCost) + "</strong></div>" +
+          "</div>" +
+          "</div>"
+        ).join("") +
+        "</div>";
+    } else {
+      modelBreakdown.innerHTML = "";
+    }
+  }
+
   root.querySelector<HTMLInputElement>("#api-base-url")!.value = settings.baseUrl;
-  const publicUrl = root.querySelector<HTMLInputElement>("#public-base-url"); if (publicUrl && document.activeElement !== publicUrl) publicUrl.value = settings.publicBaseUrl || window.location.origin;
+  const publicUrl = root.querySelector<HTMLInputElement>("#public-base-url");
+  if (publicUrl && document.activeElement !== publicUrl) publicUrl.value = settings.publicBaseUrl || window.location.origin;
+
   const accounts = root.querySelector<HTMLElement>("#account-list")!;
   accounts.innerHTML = credentials.length ? credentials.map((item) => "<div class=\"credential-row\"><div class=\"credential-identity\"><strong>" + escapeHtml(item.label) + "</strong><code>••••" + escapeHtml(item.hint) + "</code></div><div class=\"credential-models\">" + escapeHtml(item.models.length ? item.models.join(", ") : "暂无模型") + "</div><div><span class=\"credential-status " + (item.status === "active" ? "ok\">可用" : "disabled\">已禁用") + "</span></div><div class=\"credential-actions\"><button class=\"icon-button\" data-disable-account=\"" + escapeHtml(item.id) + "\" title=\"禁用账号\" aria-label=\"禁用账号\">" + icon("Trash2", { width: 16, height: 16 }) + "</button></div></div>").join("") : "<div class=\"empty-state\"><strong>还没有 Cursor 账号</strong><span>添加第一把账号 Key，开始建立账号池。</span></div>";
   accounts.querySelectorAll<HTMLElement>("[data-disable-account]").forEach((button) => button.addEventListener("click", () => { void requestJson("/api/credentials/" + encodeURIComponent(button.dataset.disableAccount || ""), { method: "DELETE" }).then(refresh).catch((error) => notice(error instanceof Error ? error.message : "禁用失败", true)); }));
+
   const keys = root.querySelector<HTMLElement>("#client-key-list")!;
   keys.innerHTML = clientKeys.length ? clientKeys.map((item) => "<div class=\"client-key-row\"><strong>" + escapeHtml(item.label) + "</strong><code>sk-••••" + escapeHtml(item.hint) + "</code><time>" + escapeHtml(new Date(item.createdAt).toLocaleString()) + "</time><button class=\"icon-button\" data-revoke-key=\"" + escapeHtml(item.id) + "\" title=\"撤销 API Key\" aria-label=\"撤销 API Key\">" + icon("Trash2", { width: 16, height: 16 }) + "</button></div>").join("") : "<div class=\"empty-state\"><strong>还没有客户端 API Key</strong><span>创建 Key 后即可接入 OpenAI、Anthropic 或 Responses 客户端。</span></div>";
   keys.querySelectorAll<HTMLElement>("[data-revoke-key]").forEach((button) => button.addEventListener("click", () => { void requestJson("/api/keys/" + encodeURIComponent(button.dataset.revokeKey || ""), { method: "DELETE" }).then(refresh).catch((error) => notice(error instanceof Error ? error.message : "撤销失败", true)); }));
+
   hydrateIcons(root);
 }
