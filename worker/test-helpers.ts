@@ -93,8 +93,10 @@ class FakeStatement {
       const row = this.db.apiKeys.get(String(id));
       if (row) row.last_used_at = String(lastUsedAt);
     } else if (normalized.startsWith("INSERT INTO request_logs")) {
-      const [id, accountId, endpoint, model, cursorAgentId, cursorRunId, status, promptChars, completionChars, error, createdAt, completedAt] =
-        this.values;
+      const [
+        id, accountId, endpoint, model, cursorAgentId, cursorRunId, status, promptChars, completionChars, error,
+        createdAt, completedAt, requestId, conversationId
+      ] = this.values;
       this.db.requestLogs.set(String(id), {
         id,
         account_id: accountId,
@@ -107,10 +109,17 @@ class FakeStatement {
         completion_chars: completionChars,
         error,
         created_at: createdAt,
-        completed_at: completedAt
+        completed_at: completedAt,
+        request_id: requestId ?? null,
+        conversation_id: conversationId ?? null
       });
     } else if (normalized.startsWith("UPDATE request_logs")) {
-      const [status, completionChars, cursorAgentId, cursorRunId, error, completedAt, id] = this.values;
+      const [
+        status, completionChars, cursorAgentId, cursorRunId, error, completedAt,
+        inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, totalTokens, reasoningTokens,
+        inputCost, outputCost, cacheReadCost, cacheWriteCost, totalCost,
+        durationMs, firstTokenMs, cacheHitRate, id
+      ] = this.values;
       const row = this.db.requestLogs.get(String(id));
       if (row) {
         row.status = status;
@@ -119,6 +128,20 @@ class FakeStatement {
         row.cursor_run_id = cursorRunId || row.cursor_run_id;
         row.error = error;
         row.completed_at = completedAt;
+        row.input_tokens = inputTokens;
+        row.output_tokens = outputTokens;
+        row.cache_read_tokens = cacheReadTokens;
+        row.cache_write_tokens = cacheWriteTokens;
+        row.total_tokens = totalTokens;
+        row.reasoning_tokens = reasoningTokens;
+        row.input_cost = inputCost;
+        row.output_cost = outputCost;
+        row.cache_read_cost = cacheReadCost;
+        row.cache_write_cost = cacheWriteCost;
+        row.total_cost = totalCost;
+        row.duration_ms = durationMs;
+        row.first_token_ms = firstTokenMs;
+        row.cache_hit_rate = cacheHitRate;
       }
     } else if (normalized.startsWith("INSERT INTO sdk_sessions")) {
       const [id, ownerHash, sessionHash, agentId, createdAt, updatedAt] = this.values;

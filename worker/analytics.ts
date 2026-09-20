@@ -47,12 +47,20 @@ export interface UsageStatistics {
   cacheWriteCost: number;
   averageDurationMs: number | null;
   averageFirstTokenMs: number | null;
+  averageTokensPerSecond: number | null;
   averageCacheHitRate: number;
   modelBreakdown: Array<{
     model: string;
     requests: number;
     totalCost: number;
     totalTokens: number;
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    averageDurationMs: number | null;
+    averageFirstTokenMs: number | null;
+    averageTokensPerSecond: number | null;
+    cacheHitRate: number;
   }>;
 }
 
@@ -132,7 +140,9 @@ export async function getUsageStatistics(
       SUM(COALESCE(cache_write_cost, 0)) as cache_write_cost,
       AVG(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END) as avg_duration_ms,
       AVG(CASE WHEN first_token_ms IS NOT NULL THEN first_token_ms END) as avg_first_token_ms,
-      AVG(COALESCE(cache_hit_rate, 0)) as avg_cache_hit_rate
+      AVG(COALESCE(cache_hit_rate, 0)) as avg_cache_hit_rate,
+      SUM(CASE WHEN duration_ms > 0 THEN COALESCE(output_tokens, 0) ELSE 0 END) as timed_output_tokens,
+      SUM(CASE WHEN duration_ms > 0 AND COALESCE(output_tokens, 0) > 0 THEN duration_ms ELSE 0 END) as timed_duration_ms
     FROM request_logs
     WHERE account_id = ?
   `;
@@ -173,6 +183,8 @@ export async function getUsageStatistics(
       avg_duration_ms: number | null;
       avg_first_token_ms: number | null;
       avg_cache_hit_rate: number;
+      timed_output_tokens: number | null;
+      timed_duration_ms: number | null;
     }>();
 
   // Get model breakdown
@@ -181,7 +193,15 @@ export async function getUsageStatistics(
       model,
       COUNT(*) as requests,
       SUM(COALESCE(total_cost, 0)) as total_cost,
-      SUM(COALESCE(total_tokens, 0)) as total_tokens
+      SUM(COALESCE(total_tokens, 0)) as total_tokens,
+      SUM(COALESCE(input_tokens, 0)) as input_tokens,
+      SUM(COALESCE(output_tokens, 0)) as output_tokens,
+      SUM(COALESCE(cache_read_tokens, 0)) as cache_read_tokens,
+      SUM(COALESCE(cache_write_tokens, 0)) as cache_write_tokens,
+      AVG(CASE WHEN duration_ms IS NOT NULL THEN duration_ms END) as avg_duration_ms,
+      AVG(CASE WHEN first_token_ms IS NOT NULL THEN first_token_ms END) as avg_first_token_ms,
+      SUM(CASE WHEN duration_ms > 0 THEN COALESCE(output_tokens, 0) ELSE 0 END) as timed_output_tokens,
+      SUM(CASE WHEN duration_ms > 0 AND COALESCE(output_tokens, 0) > 0 THEN duration_ms ELSE 0 END) as timed_duration_ms
     FROM request_logs
     WHERE account_id = ? AND model IS NOT NULL
   `;
@@ -211,6 +231,14 @@ export async function getUsageStatistics(
           requests: number;
           total_cost: number;
           total_tokens: number;
+          input_tokens: number;
+          output_tokens: number;
+          cache_read_tokens: number;
+          cache_write_tokens: number;
+          avg_duration_ms: number | null;
+          avg_first_token_ms: number | null;
+          timed_output_tokens: number | null;
+          timed_duration_ms: number | null;
         }>()
       : { results: [] };
 
@@ -230,7 +258,28 @@ export async function getUsageStatistics(
     cacheWriteCost: stats?.cache_write_cost || 0,
     averageDurationMs: stats?.avg_duration_ms || null,
     averageFirstTokenMs: stats?.avg_first_token_ms || null,
+    averageTokensPerSecond: tokensPerSecond(stats?.timed_output_tokens, stats?.timed_duration_ms),
     averageCacheHitRate: stats?.avg_cache_hit_rate || 0,
-    modelBreakdown: modelResult.results ?? []
+    modelBreakdown: (modelResult.results ?? []).map((row) => {
+      const promptTokens = (row.input_tokens || 0) + (row.cache_read_tokens || 0) + (row.cache_write_tokens || 0);
+      return {
+        model: row.model,
+        requests: row.requests || 0,
+        totalCost: row.total_cost || 0,
+        totalTokens: row.total_tokens || 0,
+        inputTokens: row.input_tokens || 0,
+        outputTokens: row.output_tokens || 0,
+        cacheReadTokens: row.cache_read_tokens || 0,
+        averageDurationMs: row.avg_duration_ms ?? null,
+        averageFirstTokenMs: row.avg_first_token_ms ?? null,
+        averageTokensPerSecond: tokensPerSecond(row.timed_output_tokens, row.timed_duration_ms),
+        cacheHitRate: promptTokens > 0 ? (row.cache_read_tokens || 0) / promptTokens : 0
+      };
+    })
   };
+}
+
+function tokensPerSecond(outputTokens: number | null | undefined, durationMs: number | null | undefined): number | null {
+  if (!outputTokens || !durationMs || durationMs <= 0) return null;
+  return outputTokens / (durationMs / 1000);
 }

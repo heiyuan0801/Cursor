@@ -688,7 +688,8 @@ async function handleOpenAiCompletion(
         responseOwner,
         sdkSessionKey,
         chatSession,
-        finishLog
+        finishLog,
+        startTime
       });
     }
 
@@ -709,7 +710,7 @@ async function handleOpenAiCompletion(
         tools: prepared.tools,
           context: prepared.toolContext,
           onBillingError,
-          onDone: async (text, completionChars, toolCalls) => {
+          onDone: async (text, completionChars, toolCalls, usage, firstTokenMs) => {
           if (route.kind === "responses" && responseOwner) {
             const completed = responseObject({
               id,
@@ -733,7 +734,8 @@ async function handleOpenAiCompletion(
           return finishLog({
             status: "completed",
             completionChars,
-            usage
+            usage,
+            firstTokenMs
           });
         },
         onError: (error) =>
@@ -741,7 +743,7 @@ async function handleOpenAiCompletion(
             status: "error",
             error: error instanceof Error ? error.message : String(error)
           })
-      }, ctx);
+      }, ctx, startTime);
     }
 
     const output = await collectCursorOutput(completion.stream);
@@ -876,6 +878,8 @@ async function handleSdkPreparedOpenAiRoute(input: {
   sdkSessionKey?: string;
   chatSession?: ChatCompletionSession;
   finishLog: (input: Parameters<typeof completeRequestLog>[2]) => Promise<void>;
+  /** Request start, so the streamed time-to-first-token is measured from the same origin as the duration. */
+  startTime?: number;
 }): Promise<Response> {
   const completion = await createCursorSdkCompletion(input.env, input.deps, input.auth.cursorApiKey, {
     prompt: input.prepared.prompt,
@@ -886,6 +890,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
     workingDirectory: input.prepared.toolContext?.workingDirectory,
     clientTools: input.prepared.tools,
     requiresLocalTool: input.prepared.requiresLocalTool,
+    stream: input.prepared.stream,
     allowToolCall: (toolCall) => {
       if (!input.prepared.tools.length) return "No client tool inventory was available for this request.";
       const toolCalls = toOpenAiToolCalls({
@@ -910,7 +915,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
       tools: input.prepared.tools,
       context: input.prepared.toolContext,
       onBillingError: input.onBillingError,
-      onDone: async (text, completionChars, toolCalls, usage) => {
+      onDone: async (text, completionChars, toolCalls, usage, firstTokenMs) => {
         input.chatSession?.remember(text, toolCalls);
         if (input.route.kind === "responses" && input.responseOwner) {
           const completed = responseObject({
@@ -937,7 +942,9 @@ async function handleSdkPreparedOpenAiRoute(input: {
           status: "completed",
           completionChars,
           cursorAgentId: completion.agentId,
-          cursorRunId: completion.runId
+          cursorRunId: completion.runId,
+          usage,
+          firstTokenMs
         });
       },
       onError: (error) =>
@@ -947,7 +954,7 @@ async function handleSdkPreparedOpenAiRoute(input: {
           cursorAgentId: completion.agentId,
           cursorRunId: completion.runId
         })
-    }, input.ctx);
+    }, input.ctx, input.startTime);
   }
 
   const output = await collectCursorSdkOutput(completion.stream);
@@ -963,7 +970,8 @@ async function handleSdkPreparedOpenAiRoute(input: {
     status: "completed",
     completionChars,
     cursorAgentId: completion.agentId,
-    cursorRunId: completion.runId
+    cursorRunId: completion.runId,
+    usage: output.usage
   });
 
   if (input.route.kind === "chat") {
@@ -1067,6 +1075,7 @@ async function handleOpenCodeSdkChatRoute(
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
+      stream: prepared.stream,
       allowToolCall: (toolCall) => {
         const toolCalls = toOpenAiToolCalls({
           toolCalls: [toolCall],
@@ -1090,13 +1099,14 @@ async function handleOpenCodeSdkChatRoute(
         tools: prepared.tools,
         context: prepared.toolContext,
         onBillingError,
-        onDone: (_text, completionChars, _toolCalls, usage) =>
+        onDone: (_text, completionChars, _toolCalls, usage, firstTokenMs) =>
           finishLog({
             status: "completed",
             completionChars,
             cursorAgentId: completion.agentId,
             cursorRunId: completion.runId,
-            usage
+            usage,
+            firstTokenMs
           }),
         onError: (error) =>
           finishLog({
@@ -1105,7 +1115,7 @@ async function handleOpenCodeSdkChatRoute(
             cursorAgentId: completion.agentId,
             cursorRunId: completion.runId
           })
-      }, ctx);
+      }, ctx, startTime);
     }
 
     const output = await collectCursorSdkOutput(completion.stream);
@@ -1161,13 +1171,15 @@ function streamOpenAiResponse(
       text: string,
       completionChars: number,
       toolCalls: ReturnType<typeof toOpenAiToolCalls>,
-      usage?: CursorTokenUsage
+      usage?: CursorTokenUsage,
+      firstTokenMs?: number
     ) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   },
-  ctx: ExecutionContext
+  ctx: ExecutionContext,
+  startTime?: number
 ): Response {
-  return streamOpenAiEvents(kind, streamCursorText(cursorStream), input, ctx);
+  return streamOpenAiEvents(kind, streamCursorText(cursorStream), input, ctx, startTime);
 }
 
 function streamOpenAiEvents(
@@ -1187,7 +1199,8 @@ function streamOpenAiEvents(
       text: string,
       completionChars: number,
       toolCalls: ReturnType<typeof toOpenAiToolCalls>,
-      usage?: CursorTokenUsage
+      usage?: CursorTokenUsage,
+      firstTokenMs?: number
     ) => Promise<void>;
     onError: (error: unknown) => Promise<void>;
   },

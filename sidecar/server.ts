@@ -84,6 +84,7 @@ import {
   parseCursorCredentialEnv
 } from "./router";
 import { LocalAuthStore, sessionCookie, sessionToken } from "./auth";
+import { UsageStore, type UsageRecord } from "./usage";
 
 const HOST = process.env.HOST?.trim() || "127.0.0.1";
 const DEFAULT_PORT = 8787;
@@ -135,6 +136,22 @@ const credentialPool = new CursorCredentialPool(
 const authStatePath = process.env.LOCAL_AUTH_STATE_PATH?.trim()
   || (process.env.CURSOR_ROUTER_STATE_PATH?.trim() || ".cursor2api/router-state.json") + ".auth";
 const authStore = new LocalAuthStore(authStatePath, process.env.ADMIN_PASSWORD || "");
+const usageStatePath = process.env.USAGE_LOG_STATE_PATH?.trim()
+  || (process.env.CURSOR_ROUTER_STATE_PATH?.trim() || ".cursor2api/router-state.json") + ".usage";
+const usageStore = new UsageStore(usageStatePath, Number(process.env.USAGE_LOG_LIMIT) || 1000);
+
+/** Stamp the time to first token as events flow past, so both the streaming and the
+ * collected paths report a real TTFT instead of leaving the console blank. */
+function trackFirstToken(stream: AsyncIterable<CursorTextEvent>, record: UsageRecord): AsyncIterable<CursorTextEvent> {
+  return {
+    async *[Symbol.asyncIterator]() {
+      for await (const event of stream) {
+        if (event.type === "text" || event.type === "tool_call") record.markFirstToken();
+        yield event;
+      }
+    }
+  };
+}
 
 /**
  * The SDK bridge path (full macOS parity) is the PRIMARY route for
@@ -550,6 +567,42 @@ async function handleSettings(request: Request): Promise<Response> {
   return notFound();
 }
 
+function usageQuery(request: Request): { startDate?: string; endDate?: string; model?: string; status?: string; endpoint?: string } {
+  const params = new URL(request.url).searchParams;
+  return {
+    startDate: params.get("start_date") || undefined,
+    endDate: params.get("end_date") || undefined,
+    model: params.get("model") || undefined,
+    status: params.get("status") || undefined,
+    endpoint: params.get("endpoint") || undefined
+  };
+}
+
+async function handleUsageStats(request: Request): Promise<Response> {
+  if (!hasAdminSession(request)) return unauthorized();
+  if (request.method !== "GET") return notFound();
+  return json(usageStore.statistics(usageQuery(request)));
+}
+
+async function handleUsageLogs(request: Request): Promise<Response> {
+  if (!hasAdminSession(request)) return unauthorized();
+  if (request.method === "DELETE") {
+    usageStore.clear();
+    return json({ ok: true });
+  }
+  if (request.method !== "GET") return notFound();
+  const params = new URL(request.url).searchParams;
+  const limit = Number.parseInt(params.get("limit") || "50", 10);
+  const offset = Number.parseInt(params.get("offset") || "0", 10);
+  return json({
+    data: usageStore.list({
+      ...usageQuery(request),
+      limit: Number.isFinite(limit) ? limit : 50,
+      offset: Number.isFinite(offset) ? offset : 0
+    })
+  });
+}
+
 async function handleClientKeys(request: Request, keyId = ""): Promise<Response> {
   if (!hasAdminSession(request)) return unauthorized();
   if (request.method === "GET" && !keyId) return json({ data: authStore.listClientKeys() });
@@ -682,67 +735,88 @@ async function handleChatCompletionsWithKey(
 
   const id = `chatcmpl_${crypto.randomUUID().replaceAll("-", "")}`;
   const created = Math.floor(deps.now().getTime() / 1000);
-
-  if (hasSdkBridge()) {
-    const messages = chatMessagesFromBody(body);
-    const ownerKey = sdkSessionOwner(apiKey);
-    const explicit = explicitSessionAffinity(request);
-    // An explicit affinity header wins; otherwise recognize the conversation by its content
-    // so plain OpenAI clients get agent reuse (and therefore prefix-cache hits) too.
-    const session = explicit
-      ? { sessionKey: explicit, newTurnStart: newTurnStartIndex(messages), resumed: true }
-      : await resolveChatSession(messages, ownerKey, deps.now().getTime(), () => `session-${crypto.randomUUID()}`);
-    return handleSdkRoute("chat", request, prepared, apiKey, id, created, {
-      sessionKey: session.sessionKey,
-      incrementalPrompt: chatIncrementalPrompt(body, cursorModel, newTurnMessages(messages, session)),
-      remember: (text, toolCalls) =>
-        rememberChatSession({
-          messages,
-          ownerKey,
-          sessionKey: session.sessionKey,
-          assistantText: text,
-          assistantToolCalls: toolCalls,
-          now: deps.now().getTime()
-        }).catch(() => undefined)
-    }, onBillingError);
-  }
-
-  const completion = await createCursorCompletion(env, deps, apiKey, {
-    prompt: prepared.prompt,
-    model: prepared.cursorModel
+  const record = usageStore.start({
+    endpoint: "chat",
+    model: prepared.model,
+    promptChars: prepared.promptChars,
+    stream: prepared.stream
   });
 
-  if (prepared.stream) {
-    return streamOpenAiResponse("chat", completion.stream, {
-      id,
-      created,
-      model: prepared.model,
-      promptChars: prepared.promptChars,
-      includeUsage: prepared.includeUsage,
-      tools: prepared.tools,
-      context: prepared.toolContext,
-      onError: onBillingError
+  try {
+    if (hasSdkBridge()) {
+      const messages = chatMessagesFromBody(body);
+      const ownerKey = sdkSessionOwner(apiKey);
+      const explicit = explicitSessionAffinity(request);
+      // An explicit affinity header wins; otherwise recognize the conversation by its content
+      // so plain OpenAI clients get agent reuse (and therefore prefix-cache hits) too.
+      const session = explicit
+        ? { sessionKey: explicit, newTurnStart: newTurnStartIndex(messages), resumed: true }
+        : await resolveChatSession(messages, ownerKey, deps.now().getTime(), () => `session-${crypto.randomUUID()}`);
+      return await handleSdkRoute("chat", request, prepared, apiKey, id, created, {
+        sessionKey: session.sessionKey,
+        incrementalPrompt: chatIncrementalPrompt(body, cursorModel, newTurnMessages(messages, session)),
+        remember: (text, toolCalls) =>
+          rememberChatSession({
+            messages,
+            ownerKey,
+            sessionKey: session.sessionKey,
+            assistantText: text,
+            assistantToolCalls: toolCalls,
+            now: deps.now().getTime()
+          }).catch(() => undefined)
+      }, onBillingError, record);
+    }
+
+    const completion = await createCursorCompletion(env, deps, apiKey, {
+      prompt: prepared.prompt,
+      model: prepared.cursorModel
     });
-  }
 
-  const output = await collectCursorOutput(completion.stream);
-  const toolCalls = toOpenAiToolCalls({
-    toolCalls: output.toolCalls,
-    tools: prepared.tools,
-    responseId: id,
-    context: prepared.toolContext
-  });
-  return json(
-    chatCompletionResponse({
-      id,
-      created,
-      model: prepared.model,
-      text: output.text,
-      toolCalls,
-      promptChars: prepared.promptChars,
-      metadata: prepared.responseMetadata
-    })
-  );
+    if (prepared.stream) {
+      return streamOpenAiEvents("chat", trackFirstToken(streamCursorText(completion.stream), record), {
+        id,
+        created,
+        model: prepared.model,
+        promptChars: prepared.promptChars,
+        includeUsage: prepared.includeUsage,
+        tools: prepared.tools,
+        context: prepared.toolContext,
+        onDone: (_text, completionChars, _toolCalls, usage) =>
+          record.finish({ status: "completed", completionChars, usage }),
+        onError: (error) => {
+          record.finish({ status: "error", error });
+          onBillingError?.(error);
+        }
+      });
+    }
+
+    const output = await collectCursorOutput(completion.stream);
+    const toolCalls = toOpenAiToolCalls({
+      toolCalls: output.toolCalls,
+      tools: prepared.tools,
+      responseId: id,
+      context: prepared.toolContext
+    });
+    record.finish({
+      status: "completed",
+      completionChars: completionCharsFromOutput(output.text, toolCalls),
+      usage: output.usage
+    });
+    return json(
+      chatCompletionResponse({
+        id,
+        created,
+        model: prepared.model,
+        text: output.text,
+        toolCalls,
+        promptChars: prepared.promptChars,
+        metadata: prepared.responseMetadata
+      })
+    );
+  } catch (error) {
+    record.finish({ status: "error", error });
+    throw error;
+  }
 }
 
 async function handleResponses(request: Request): Promise<Response> {
@@ -765,62 +839,83 @@ async function handleResponsesWithKey(
 
   const id = `resp_${crypto.randomUUID().replaceAll("-", "")}`;
   const created = Math.floor(deps.now().getTime() / 1000);
-
-  if (hasSdkBridge()) {
-    return handleSdkRoute("responses", request, prepared, apiKey, id, created, undefined, onBillingError);
-  }
-
-  const completion = await createCursorCompletion(env, deps, apiKey, {
-    prompt: prepared.prompt,
-    model: prepared.cursorModel
+  const record = usageStore.start({
+    endpoint: "responses",
+    model: prepared.model,
+    promptChars: prepared.promptChars,
+    stream: prepared.stream
   });
 
-  if (prepared.stream) {
-    return streamOpenAiResponse("responses", completion.stream, {
+  try {
+    if (hasSdkBridge()) {
+      return await handleSdkRoute("responses", request, prepared, apiKey, id, created, undefined, onBillingError, record);
+    }
+
+    const completion = await createCursorCompletion(env, deps, apiKey, {
+      prompt: prepared.prompt,
+      model: prepared.cursorModel
+    });
+
+    if (prepared.stream) {
+      return streamOpenAiEvents("responses", trackFirstToken(streamCursorText(completion.stream), record), {
+        id,
+        created,
+        model: prepared.model,
+        promptChars: prepared.promptChars,
+        includeUsage: prepared.includeUsage,
+        metadata: prepared.responseMetadata,
+        tools: prepared.tools,
+        context: prepared.toolContext,
+        onError: (error) => {
+          record.finish({ status: "error", error });
+          onBillingError?.(error);
+        },
+        onDone: (text, completionChars, toolCalls, usage) => {
+          record.finish({ status: "completed", completionChars, usage });
+          storeResponse(
+            id,
+            responseObject({
+              id,
+              created,
+              model: prepared.model,
+              text,
+              toolCalls,
+              promptChars: prepared.promptChars,
+              metadata: prepared.responseMetadata,
+              usage
+            })
+          );
+        }
+      });
+    }
+
+    const output = await collectCursorOutput(completion.stream);
+    const toolCalls = toOpenAiToolCalls({
+      toolCalls: output.toolCalls,
+      tools: prepared.tools,
+      responseId: id,
+      context: prepared.toolContext
+    });
+    record.finish({
+      status: "completed",
+      completionChars: completionCharsFromOutput(output.text, toolCalls),
+      usage: output.usage
+    });
+    const response = responseObject({
       id,
       created,
       model: prepared.model,
+      text: output.text,
+      toolCalls,
       promptChars: prepared.promptChars,
-      includeUsage: prepared.includeUsage,
-      metadata: prepared.responseMetadata,
-      tools: prepared.tools,
-      context: prepared.toolContext,
-      onError: onBillingError,
-      onDone: (text, _completionChars, toolCalls) => {
-        storeResponse(
-          id,
-          responseObject({
-            id,
-            created,
-            model: prepared.model,
-            text,
-            toolCalls,
-            promptChars: prepared.promptChars,
-            metadata: prepared.responseMetadata
-          })
-        );
-      }
+      metadata: prepared.responseMetadata
     });
+    storeResponse(id, response);
+    return json(response);
+  } catch (error) {
+    record.finish({ status: "error", error });
+    throw error;
   }
-
-  const output = await collectCursorOutput(completion.stream);
-  const toolCalls = toOpenAiToolCalls({
-    toolCalls: output.toolCalls,
-    tools: prepared.tools,
-    responseId: id,
-    context: prepared.toolContext
-  });
-  const response = responseObject({
-    id,
-    created,
-    model: prepared.model,
-    text: output.text,
-    toolCalls,
-    promptChars: prepared.promptChars,
-    metadata: prepared.responseMetadata
-  });
-  storeResponse(id, response);
-  return json(response);
 }
 
 // ---------------------------------------------------------------------------
@@ -995,39 +1090,58 @@ async function handleAnthropicMessagesWithKey(
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
+      stream: prepared.stream,
       allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
     });
     return completion.stream;
   };
-  const stream = retryingSdkStream(makeStream);
+  const record = usageStore.start({
+    endpoint: "anthropic",
+    model: prepared.model,
+    promptChars: prepared.promptChars,
+    stream: prepared.stream
+  });
+  const stream = trackFirstToken(retryingSdkStream(makeStream), record);
 
-  if (prepared.stream) {
-    return anthropicSseResponse(anthropicSseEvents({
+  try {
+    if (prepared.stream) {
+      return anthropicSseResponse(anthropicSseEvents({
+        id,
+        model: requestedModel,
+        inputTokens,
+        stream,
+        tools: prepared.tools,
+        toolContext: prepared.toolContext,
+        onDone: (text, toolUseBlocks, summary) => {
+          record.finish({ status: "completed", completionChars: summary.outputChars, usage: summary.usage });
+          remember(text, toolUseBlocks);
+        }
+      }), (error) => {
+        record.finish({ status: "error", error });
+        onBillingError?.(error);
+      });
+    }
+
+    const output = await collectCursorSdkOutput(stream);
+    const message = anthropicMessage({
       id,
       model: requestedModel,
-      inputTokens,
-      stream,
+      text: output.text,
+      toolCalls: output.toolCalls,
       tools: prepared.tools,
       toolContext: prepared.toolContext,
-      onDone: remember
-    }), onBillingError);
+      inputTokens,
+      outputTokens: estimateTokens(output.text.length),
+      usage: output.usage
+    });
+    record.finish({ status: "completed", completionChars: output.text.length, usage: output.usage });
+    // Fingerprint the turn the client will replay, which is the message we are about to send.
+    remember(output.text, message.content as Array<Record<string, unknown>>);
+    return json(message);
+  } catch (error) {
+    record.finish({ status: "error", error });
+    throw error;
   }
-
-  const output = await collectCursorSdkOutput(stream);
-  const message = anthropicMessage({
-    id,
-    model: requestedModel,
-    text: output.text,
-    toolCalls: output.toolCalls,
-    tools: prepared.tools,
-    toolContext: prepared.toolContext,
-    inputTokens,
-    outputTokens: estimateTokens(output.text.length),
-    usage: output.usage
-  });
-  // Fingerprint the turn the client will replay, which is the message we are about to send.
-  remember(output.text, message.content as Array<Record<string, unknown>>);
-  return json(message);
 }
 
 /** `POST /v1/messages/count_tokens` — Claude Code's pre-send estimate. Uses the
@@ -1055,7 +1169,8 @@ async function handleSdkRoute(
   id: string,
   created: number,
   session?: SdkRouteSession,
-  onBillingError?: (error: unknown) => void
+  onBillingError?: (error: unknown) => void,
+  record?: UsageRecord
 ): Promise<Response> {
   logToolForwarding(kind, prepared);
   // Maintain one SDK agent per client conversation "under the hood": attempt 0 reuses the
@@ -1075,11 +1190,13 @@ async function handleSdkRoute(
       workingDirectory: prepared.toolContext?.workingDirectory,
       clientTools: prepared.tools,
       requiresLocalTool: prepared.requiresLocalTool,
+      stream: prepared.stream,
       allowToolCall: (toolCall) => sdkAllowToolCall(prepared, toolCall)
     });
     return completion.stream;
   };
-  const stream = retryingSdkStream(makeStream);
+  const base = retryingSdkStream(makeStream);
+  const stream = record ? trackFirstToken(base, record) : base;
 
   if (prepared.stream) {
     return streamOpenAiEvents(kind, stream, {
@@ -1091,8 +1208,12 @@ async function handleSdkRoute(
       metadata: prepared.responseMetadata,
       tools: prepared.tools,
       context: prepared.toolContext,
-      onError: onBillingError,
-      onDone: (text, _completionChars, toolCalls, usage) => {
+      onError: (error) => {
+        record?.finish({ status: "error", error });
+        onBillingError?.(error);
+      },
+      onDone: (text, completionChars, toolCalls, usage) => {
+        record?.finish({ status: "completed", completionChars, usage });
         session?.remember?.(text, toolCalls);
         if (kind === "responses") {
           storeResponse(
@@ -1119,6 +1240,11 @@ async function handleSdkRoute(
     tools: prepared.tools,
     responseId: id,
     context: prepared.toolContext
+  });
+  record?.finish({
+    status: "completed",
+    completionChars: completionCharsFromOutput(output.text, toolCalls),
+    usage: output.usage
   });
   session?.remember?.(output.text, toolCalls);
 
@@ -1193,10 +1319,6 @@ interface StreamInput {
   context?: ToolCallContext;
   onDone?: (text: string, completionChars: number, toolCalls: OpenAiToolCall[], usage?: CursorTokenUsage) => void;
   onError?: (error: unknown) => void | Promise<void>;
-}
-
-function streamOpenAiResponse(kind: "chat" | "responses", cursorStream: Response, input: StreamInput): Response {
-  return streamOpenAiEvents(kind, streamCursorText(cursorStream), input);
 }
 
 function streamOpenAiEvents(
@@ -1403,6 +1525,10 @@ async function route(request: Request, port: number): Promise<Response> {
     }
 
     if (pathname === "/api/settings") return await handleSettings(request);
+
+    if (pathname === "/api/usage") return await handleUsageStats(request);
+
+    if (pathname === "/api/logs") return await handleUsageLogs(request);
 
     if (pathname === "/api/keys") return await handleClientKeys(request);
 

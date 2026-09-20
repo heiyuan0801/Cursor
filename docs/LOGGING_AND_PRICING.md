@@ -34,13 +34,26 @@ Additional metadata tracked:
 - Status (running, completed, error)
 - Error messages (if any)
 
+## Where the data lives
+
+There are two independent ledgers, and which one answers `/api/usage` depends on how the
+gateway runs:
+
+- **Worker deployment**: `request_logs` in D1, scoped to an account, read with a `cmp_` key.
+- **Local sidecar (the desktop app and the control console)**: an in-process ledger in
+  `sidecar/usage.ts`, persisted next to the router state (`<CURSOR_ROUTER_STATE_PATH>.usage`,
+  override with `USAGE_LOG_STATE_PATH`, cap with `USAGE_LOG_LIMIT`). It is read with the
+  console's admin session cookie, not with a client API key.
+
+Both expose the same response shape, so the console renders either one.
+
 ## API Endpoints
 
 ### Get Usage Statistics
 
 ```bash
 GET /api/usage?start_date=2026-01-01&end_date=2026-12-31&model=claude-sonnet-5
-Authorization: Bearer cmp_YOUR_API_KEY
+Authorization: Bearer cmp_YOUR_API_KEY   # worker only; the sidecar uses the console session
 ```
 
 **Query Parameters:**
@@ -86,7 +99,7 @@ Authorization: Bearer cmp_YOUR_API_KEY
 
 ```bash
 GET /api/logs?limit=100&offset=0&status=completed&model=claude-sonnet-5
-Authorization: Bearer cmp_YOUR_API_KEY
+Authorization: Bearer cmp_YOUR_API_KEY   # worker only; the sidecar uses the console session
 ```
 
 **Query Parameters:**

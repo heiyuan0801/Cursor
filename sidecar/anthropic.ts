@@ -339,8 +339,13 @@ export async function* anthropicSseEvents(opts: {
   tools?: OpenAiToolSpec[];
   toolContext?: ToolCallContext;
   /** Called once the stream finishes cleanly, with the assistant turn as the client will
-   * replay it: the completed text and the tool_use blocks that were emitted. */
-  onDone?: (text: string, toolUseBlocks: Array<Record<string, unknown>>) => void;
+   * replay it: the completed text and the tool_use blocks that were emitted. The summary
+   * carries what the usage ledger needs but the session cache does not. */
+  onDone?: (
+    text: string,
+    toolUseBlocks: Array<Record<string, unknown>>,
+    summary: { usage?: CursorTokenUsage; outputChars: number }
+  ) => void;
 }): AsyncGenerator<{ event: string; data: Record<string, unknown> }> {
   yield {
     event: "message_start",
@@ -422,5 +427,5 @@ export async function* anthropicSseEvents(opts: {
     }
   };
   yield { event: "message_stop", data: { type: "message_stop" } };
-  opts.onDone?.(text, toolUseBlocks);
+  opts.onDone?.(text, toolUseBlocks, { usage, outputChars });
 }
