@@ -6,6 +6,26 @@ import {
   isTransientCursorSdkError
 } from "./cursor-sdk";
 
+/** One NDJSON line per bridge event, delivered in separate chunks like the real bridge. */
+function ndjsonResponse(events: unknown[]): Response {
+  const encoder = new TextEncoder();
+  return new Response(
+    new ReadableStream<Uint8Array>({
+      start(controller) {
+        for (const event of events) controller.enqueue(encoder.encode(`${JSON.stringify(event)}\n`));
+        controller.close();
+      }
+    }),
+    { status: 200, headers: { "Content-Type": "application/x-ndjson" } }
+  );
+}
+
+async function drain(stream: AsyncIterable<any>): Promise<any[]> {
+  const events: any[] = [];
+  for await (const event of stream) events.push(event);
+  return events;
+}
+
 describe("Cursor SDK harness", () => {
   it("classifies abrupt bridge socket closures as transient", () => {
     expect(isTransientCursorSdkError(new TypeError(
@@ -126,6 +146,139 @@ describe("Cursor SDK harness", () => {
 
     expect(body.prompt).toBe("FULL TRANSCRIPT");
     expect(body.incrementalPrompt).toBe("ONLY THE NEW TURN");
+  });
+
+  it("asks the bridge for incremental events and yields text as it arrives", async () => {
+    let body: Record<string, unknown> = {};
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-09-20T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async (_url: any, init: any) => {
+          body = JSON.parse(String(init.body));
+          return ndjsonResponse([
+            { type: "text", text: "<svg " },
+            { type: "text", text: "viewBox=\"0 0 10 10\">" },
+            {
+              type: "done",
+              output: {
+                text: "<svg viewBox=\"0 0 10 10\">",
+                toolCalls: [],
+                status: "completed",
+                usage: { inputTokens: 10, outputTokens: 5, cacheReadTokens: 0, cacheWriteTokens: 0, totalTokens: 15 }
+              }
+            }
+          ]);
+        }
+      },
+      "cursor-test-key",
+      { prompt: { text: "draw" }, model: { id: "composer-2.5" }, sessionKey: "stream-on", stream: true }
+    );
+
+    const events = await drain(completion.stream);
+    expect(body.streamEvents).toBe(true);
+    expect(events.filter((event) => event.type === "text").map((event: any) => event.text)).toEqual([
+      "<svg ",
+      "viewBox=\"0 0 10 10\">"
+    ]);
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      finalText: "<svg viewBox=\"0 0 10 10\">",
+      usage: { inputTokens: 10, outputTokens: 5 }
+    });
+  });
+
+  it("keeps a split control marker out of the streamed text", async () => {
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-09-20T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async () =>
+          ndjsonResponse([
+            { type: "text", text: "before<|tool_c" },
+            { type: "text", text: "alls_begin|>garbage" },
+            { type: "tool_call", toolCall: { name: "shell", arguments: { command: "ls" } } },
+            { type: "done", output: { text: "", toolCalls: [{ name: "shell", arguments: { command: "ls" } }], status: "tool_call" } }
+          ])
+      },
+      "cursor-test-key",
+      { prompt: { text: "run" }, model: { id: "composer-2.5" }, sessionKey: "marker", stream: true }
+    );
+
+    const events = await drain(completion.stream);
+    const streamed = events.filter((event) => event.type === "text").map((event: any) => event.text).join("");
+    expect(streamed).toBe("before");
+    expect(events.some((event) => event.type === "tool_call")).toBe(true);
+  });
+
+  it("stays on the blocking path when the turn may need a tool-call retry", async () => {
+    let body: Record<string, unknown> = {};
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-09-20T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async (_url: any, init: any) => {
+          body = JSON.parse(String(init.body));
+          return new Response(JSON.stringify({ text: "OK", toolCalls: [], status: "completed" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          });
+        }
+      },
+      "cursor-test-key",
+      {
+        prompt: { text: "edit the file" },
+        model: { id: "composer-2.5" },
+        sessionKey: "needs-tool",
+        stream: true,
+        requiresLocalTool: true
+      }
+    );
+    await collectCursorSdkOutput(completion.stream);
+
+    expect(body.streamEvents).toBeUndefined();
+  });
+
+  it("still works against a bridge too old to understand streamEvents", async () => {
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-09-20T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        // An older bridge ignores the unknown flag and answers with one JSON blob.
+        fetch: async () =>
+          new Response(JSON.stringify({ text: "OK", toolCalls: [], status: "completed" }), {
+            status: 200,
+            headers: { "Content-Type": "application/json" }
+          })
+      },
+      "cursor-test-key",
+      { prompt: { text: "draw" }, model: { id: "composer-2.5" }, sessionKey: "legacy-bridge", stream: true }
+    );
+
+    await expect(collectCursorSdkOutput(completion.stream)).resolves.toMatchObject({ text: "OK" });
+  });
+
+  it("propagates a mid-stream bridge error instead of ending silently", async () => {
+    const completion = await createCursorSdkCompletion(
+      { CURSOR_SDK_BRIDGE_URL: "http://bridge.test/sdk" } as any,
+      {
+        now: () => new Date("2026-09-20T00:00:00Z"),
+        randomUUID: () => crypto.randomUUID(),
+        fetch: async () =>
+          ndjsonResponse([
+            { type: "text", text: "partial" },
+            { type: "error", error: { message: "upstream exploded", code: "cursor_sdk_error" } }
+          ])
+      },
+      "cursor-test-key",
+      { prompt: { text: "draw" }, model: { id: "composer-2.5" }, sessionKey: "stream-error", stream: true }
+    );
+
+    await expect(drain(completion.stream)).rejects.toThrow("upstream exploded");
   });
 
   it("reuses one agent id across turns of the same session", async () => {
