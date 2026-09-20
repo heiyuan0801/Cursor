@@ -1157,7 +1157,7 @@ pre {
 
 .usage-grid {
   display: grid;
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 16px;
   margin-top: 24px;
 }
@@ -1379,6 +1379,100 @@ pre {
 .model-stats strong {
   color: var(--ink);
   font-weight: 600;
+}
+
+/* Request log: one scrollable grid so the token/speed columns stay aligned. */
+.request-log-section {
+  margin-top: 40px;
+}
+
+.request-log-section .section-bar {
+  padding-bottom: 18px;
+  border-bottom: 1px solid var(--line);
+}
+
+.section-hint {
+  color: var(--ink-faint);
+  font-size: 0.8rem;
+}
+
+.request-log-scroll {
+  overflow-x: auto;
+}
+
+.request-log-head,
+.request-log-row {
+  display: grid;
+  grid-template-columns: 92px minmax(150px, 1.4fr) 68px repeat(8, minmax(72px, 0.8fr));
+  gap: 10px;
+  align-items: center;
+  min-width: 940px;
+}
+
+.request-log-head {
+  padding: 13px 12px;
+  color: var(--ink-faint);
+  font-size: 0.72rem;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.request-log-row {
+  padding: 11px 12px;
+  border-top: 1px solid var(--line);
+  font-size: 0.8rem;
+  font-variant-numeric: tabular-nums;
+}
+
+.request-log-row:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+
+.request-log-row time {
+  color: var(--ink-soft);
+  font-family: var(--mono);
+  font-size: 0.75rem;
+}
+
+.request-log-row code {
+  overflow: hidden;
+  font-family: var(--mono);
+  font-size: 0.75rem;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 0.78rem;
+  font-weight: 650;
+}
+
+.log-status::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #20a56a;
+}
+
+.log-status.failed {
+  color: #a34a43;
+}
+
+.log-status.failed::before {
+  background: #c65c51;
+}
+
+.log-status.running {
+  color: var(--ink-faint);
+}
+
+.log-status.running::before {
+  background: var(--ink-faint);
 }
 
 @media (max-width: 1024px) {
