@@ -1,11 +1,14 @@
 import {
   ArrowRight,
+  Activity,
   BookOpen,
   Check,
   ChevronDown,
   Code2,
   Copy,
+  Clock,
   Download,
+  DollarSign,
   Github,
   ImagePlus,
   KeyRound,
@@ -33,13 +36,16 @@ import {
 
 /** Lucide icons referenced by `data-lucide` attributes or by name in code. */
 export const icons = {
+  Activity,
   ArrowRight,
   BookOpen,
   Check,
   ChevronDown,
   Code2,
   Copy,
+  Clock,
   Download,
+  DollarSign,
   Github,
   ImagePlus,
   KeyRound,

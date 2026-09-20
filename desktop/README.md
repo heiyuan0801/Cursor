@@ -1,5 +1,7 @@
 # desktop — Windows 托盘应用（可选）
 
+> Current gateway builds require PostgreSQL, Redis and ENCRYPTION_KEY in the parent process environment (DATABASE_URL or PGHOST/PG*, plus REDIS_URL). The tray app does not provision databases. See [the migration guide](../docs/POSTGRES_REDIS_MIGRATION.md). Hosted Worker/D1 routes have been removed; release downloads require separate hosting.
+
 本目录是 **可选的 Windows 桌面壳**，不是 Linux 部署所需。跨平台 API 网关在仓库根目录 [`sidecar/`](../sidecar/)，Linux 服务器用 [`server.mjs`](../server.mjs) 启动即可。
 
 Tauri 2 系统托盘：Credential Manager 存 Key、一键配置 Agent、自动更新。默认 `http://127.0.0.1:8787/v1`。
@@ -126,8 +128,8 @@ For OpenCode, after configuring, pick the model **`cursorapi/composer-2.5`** (or
 The Tauri (Rust) backend manages **two local processes** and wires them together:
 
 1. **API server** (`api-for-cursor-server`) — a `bun --compile` sidecar exe that serves
-   the OpenAI-compatible `/v1/*` surface (reusing the repo's `worker/openai.ts` shaping
-   and `worker/cursor-sdk.ts` client). Listens on `127.0.0.1:8787`.
+   the OpenAI-compatible `/v1/*` surface (reusing the repo's `core/openai.ts` shaping
+   and `core/cursor-sdk.ts` client). Listens on `127.0.0.1:8787`.
 2. **SDK bridge** — runs the official `@cursor/sdk` agent and talks to Cursor's backend.
    It ships as a bundled **Node runtime + `cursor-sdk-local-agent-bridge.mjs` + `node_modules`**
    under `src-tauri/bridge/` (a Tauri *resource*), launched as `node <script>` on a private
@@ -213,8 +215,8 @@ bun run tauri build --target x86_64-pc-windows-msvc
 Installer output: `src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe`
 (plus a `.exe.sig` for the updater).
 
-> The build depends on sibling source in the repo (`../sidecar/server.ts`, `../worker/*.ts`, `../scripts/cursor-sdk-local-agent-bridge.mjs`).
-> Build from a full checkout (needs `../sidecar/`, `../worker/`, `../scripts/`), not `desktop/` alone.
+> The build depends on sibling source in the repo (`../sidecar/server.ts`, `../core/*.ts`, `../scripts/cursor-sdk-local-agent-bridge.mjs`).
+> Build from a full checkout (needs `../sidecar/`, `../core/`, `../scripts/`), not `desktop/` alone.
 
 ## Release pipeline (CI)
 
@@ -266,7 +268,7 @@ The updater **public** key lives in `tauri.conf.json` (`plugins.updater.pubkey`)
 
 This is the Windows port of the macOS **API for Cursor** by Standard Agents —
 [standardagents/composer-api](https://github.com/standardagents/composer-api) (MIT), which
-provides the macOS app, the Cloudflare Worker / OpenAI-compatibility layer, and the
+provides the macOS app, the original OpenAI-compatibility layer, and the
 `@cursor/sdk` bridge this app bundles. Built with [Tauri 2](https://v2.tauri.app/) and backed by
 [`@cursor/sdk`](https://www.npmjs.com/package/@cursor/sdk) + the Cursor Composer models. See
 [`BUILD_CONTRACT.md`](./BUILD_CONTRACT.md) for the detailed port decisions and the macOS→Windows

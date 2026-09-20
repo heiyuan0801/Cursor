@@ -1,217 +1,39 @@
-# Request Logging and Pricing Analytics
+# 使用日志与费用统计
 
-This document describes the enhanced request logging system with token usage tracking and cost calculation.
+本项目仅使用 PostgreSQL + Redis。使用日志保存在 PostgreSQL 的 cursor_usage_logs 表；Redis 保存登录会话和缓存，不保存业务日志。
 
-## Overview
+## 访问与筛选
 
-The system now tracks detailed token usage and calculates costs for each API request based on the model pricing data from [Wei-Shaw/model-price-repo](https://github.com/Wei-Shaw/model-price-repo).
+管理接口需要 Dashboard 登录后获得的 HttpOnly 会话 Cookie，不能使用客户端 sk- API Key 读取或删除日志。
 
-## Features
+- GET /api/usage：查询请求数、成功/失败数、Token、费用、平均耗时及模型汇总。
+- GET /api/logs：查询日志，limit 默认 100、最大 1000，offset 从 0 开始。
+- 两个查询接口均支持 start_date、end_date；省略时查询全部。
+- 使用 ISO 时间戳（带 Z 或时区偏移）表达本地范围。纯 YYYY-MM-DD 按 UTC 解释；end_date 包含当天最后一毫秒。
+- Dashboard 提供今天、昨天、近一周、近一月、全部快捷筛选。model/status 查询参数目前不提供筛选功能。
+- 非法日期、反向范围、非法分页参数返回 400。
 
-### Token Usage Tracking
+## 清理
 
-Each request now logs:
-- **Input tokens**: Tokens in the prompt
-- **Output tokens**: Tokens in the completion
-- **Cache read tokens**: Tokens served from prompt cache
-- **Cache write tokens**: Tokens written to prompt cache
-- **Total tokens**: Sum of all token usage
-- **Reasoning tokens**: Tokens used for reasoning (if applicable)
+DELETE /api/logs?before=2026-01-01T00:00:00.000Z 删除 created_at 严格早于截止时间的日志，返回实际 deleted 数量。必须显式指定 before，且不能是未来时间；不支持用 start_date/end_date 删除区间。
 
-### Cost Calculation
+Dashboard 提供清理 7、30 或 90 天前数据的手动操作。清理会直接删除 PostgreSQL 行，没有自动回收站，操作前应备份；这不是定时保留策略。
 
-Costs are calculated automatically based on:
-- Model-specific pricing
-- Token type (input, output, cache read, cache write)
-- Context window thresholds (200k/272k tokens for applicable models)
+## 记录字段
 
-### Request Metadata
+每条记录包含 id、endpoint、model、status（completed/error）、created_at、completed_at、duration_ms、error，以及：
 
-Additional metadata tracked:
-- Request ID and Conversation ID
-- Duration in milliseconds
-- Cursor Agent ID and Run ID
-- Status (running, completed, error)
-- Error messages (if any)
+- total_tokens、input_tokens、output_tokens、cache_read_tokens、cache_write_tokens。
+- total_cost、input_cost、output_cost、cache_read_cost、cache_write_cost，金额单位 USD。
 
-## API Endpoints
+created_at 是请求开始时间，completed_at 是响应结束时间；按开始时间筛选。当前不单独持久化 reasoning_tokens、Agent ID、Conversation ID 或首 Token 耗时，averageFirstTokenMs 返回 null。
 
-### Get Usage Statistics
+## 计费口径
 
-```bash
-GET /api/usage?start_date=2026-01-01&end_date=2026-12-31&model=claude-sonnet-5
-Authorization: Bearer cmp_YOUR_API_KEY
-```
+优先使用上游返回的 usage；未返回时，协议适配器按文本字符量估算 Token。流式 Chat 即使未设置 stream_options.include_usage，也会在网关内部统计，且不会额外改变客户端收到的流格式。
 
-**Query Parameters:**
-- `start_date` (optional): ISO 8601 date string
-- `end_date` (optional): ISO 8601 date string
-- `model` (optional): Filter by specific model
+输入、输出、缓存读取、缓存写入分别计费。OpenAI 的总输入已包含缓存部分，统计时会拆分，避免重复计算；Anthropic 的缓存字段单独累计。价格表位于 core/pricing.ts，是仓库内置数据，不会自动同步上游价格。未知模型使用默认基准价格估算，控制台数字不等同于 Cursor 最终账单。
 
-**Response:**
-```json
-{
-  "totalRequests": 1500,
-  "completedRequests": 1450,
-  "failedRequests": 50,
-  "totalTokens": 5000000,
-  "inputTokens": 3000000,
-  "outputTokens": 1800000,
-  "cacheReadTokens": 150000,
-  "cacheWriteTokens": 50000,
-  "totalCost": 125.50,
-  "inputCost": 60.00,
-  "outputCost": 60.00,
-  "cacheReadCost": 0.30,
-  "cacheWriteCost": 5.20,
-  "averageDurationMs": 1250.5,
-  "modelBreakdown": [
-    {
-      "model": "claude-sonnet-5",
-      "requests": 1000,
-      "totalCost": 85.00,
-      "totalTokens": 3500000
-    },
-    {
-      "model": "gpt-4o",
-      "requests": 500,
-      "totalCost": 40.50,
-      "totalTokens": 1500000
-    }
-  ]
-}
-```
+## 迁移与部署
 
-### Get Request Logs
-
-```bash
-GET /api/logs?limit=100&offset=0&status=completed&model=claude-sonnet-5
-Authorization: Bearer cmp_YOUR_API_KEY
-```
-
-**Query Parameters:**
-- `limit` (optional, default: 100, max: 1000): Number of logs to return
-- `offset` (optional, default: 0): Pagination offset
-- `start_date` (optional): ISO 8601 date string
-- `end_date` (optional): ISO 8601 date string
-- `model` (optional): Filter by model
-- `status` (optional): Filter by status (running, completed, error)
-
-**Response:**
-```json
-{
-  "data": [
-    {
-      "id": "req_abc123",
-      "account_id": "acc_xyz789",
-      "endpoint": "chat",
-      "model": "claude-sonnet-5",
-      "status": "completed",
-      "prompt_chars": 5000,
-      "completion_chars": 2000,
-      "input_tokens": 1250,
-      "output_tokens": 500,
-      "cache_read_tokens": 100,
-      "cache_write_tokens": 50,
-      "total_tokens": 1900,
-      "reasoning_tokens": 0,
-      "input_cost": 0.0025,
-      "output_cost": 0.005,
-      "cache_read_cost": 0.00002,
-      "cache_write_cost": 0.000125,
-      "total_cost": 0.007645,
-      "duration_ms": 1250,
-      "created_at": "2026-09-18T10:30:00.000Z",
-      "completed_at": "2026-09-18T10:30:01.250Z",
-      "request_id": "chatcmpl_abc123",
-      "conversation_id": "conv_xyz789"
-    }
-  ]
-}
-```
-
-## Supported Models
-
-The pricing system includes support for:
-
-### Claude Models
-- claude-opus-5
-- claude-sonnet-5
-- claude-sonnet-4
-- claude-haiku-4
-- claude-mythos-5
-- claude-fable-5
-
-### GPT Models
-- gpt-4o, gpt-4o-mini
-- gpt-5.4-mini, gpt-5.4-nano
-- gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna
-
-### Gemini Models
-- gemini-2.0-flash
-- gemini-2.5-pro
-- gemini-3-pro-preview
-
-### Other Models
-- DeepSeek (deepseek-chat, deepseek-reasoner)
-- Grok (grok-4.3, grok-4.5, grok-4.6)
-- o1, o1-mini, o3-mini
-
-## Database Schema
-
-The enhanced `request_logs` table includes:
-
-```sql
-ALTER TABLE request_logs ADD COLUMN input_tokens INTEGER DEFAULT 0;
-ALTER TABLE request_logs ADD COLUMN output_tokens INTEGER DEFAULT 0;
-ALTER TABLE request_logs ADD COLUMN cache_read_tokens INTEGER DEFAULT 0;
-ALTER TABLE request_logs ADD COLUMN cache_write_tokens INTEGER DEFAULT 0;
-ALTER TABLE request_logs ADD COLUMN total_tokens INTEGER DEFAULT 0;
-ALTER TABLE request_logs ADD COLUMN reasoning_tokens INTEGER DEFAULT 0;
-ALTER TABLE request_logs ADD COLUMN input_cost REAL DEFAULT 0.0;
-ALTER TABLE request_logs ADD COLUMN output_cost REAL DEFAULT 0.0;
-ALTER TABLE request_logs ADD COLUMN cache_read_cost REAL DEFAULT 0.0;
-ALTER TABLE request_logs ADD COLUMN cache_write_cost REAL DEFAULT 0.0;
-ALTER TABLE request_logs ADD COLUMN total_cost REAL DEFAULT 0.0;
-ALTER TABLE request_logs ADD COLUMN request_id TEXT;
-ALTER TABLE request_logs ADD COLUMN conversation_id TEXT;
-ALTER TABLE request_logs ADD COLUMN duration_ms INTEGER;
-```
-
-## Migration
-
-To enable the enhanced logging features:
-
-1. Run the migration:
-```bash
-wrangler d1 execute <DATABASE_NAME> --file=./migrations/0004_enhanced_logging.sql
-```
-
-2. Deploy the updated worker:
-```bash
-npm run deploy
-```
-
-## Cost Estimation
-
-When token usage is not available (e.g., for legacy requests), costs are estimated using:
-- Character-to-token ratio: ~4 characters per token
-- Model-specific pricing for estimated tokens
-
-## Context Window Thresholds
-
-Some models have tiered pricing based on context size:
-
-- **GPT-5 models**: 272k token threshold
-- **Grok models**: 200k token threshold
-- **Gemini models**: 200k token threshold
-
-When input exceeds these thresholds, higher pricing applies to tokens above the threshold.
-
-## Notes
-
-- All costs are in USD
-- Pricing data is updated from the upstream repository
-- Token usage is only available when the Cursor backend reports it
-- Duration includes network latency and processing time
-- Cache costs apply when prompt caching is used
+启动时自动建表，也可通过 npm run db:migrate 执行。旧 JSON 文件需显式导入，参见 [迁移指南](POSTGRES_REDIS_MIGRATION.md)。旧 Worker/D1 的建表与部署命令已删除。

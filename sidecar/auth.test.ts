@@ -1,8 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { LocalAuthStore } from "./auth";
+import { LocalAuthStore } from "./test-helpers/legacy-auth";
 
 describe("local auth store", () => {
   test("persists client key hashes and revokes keys", () => {

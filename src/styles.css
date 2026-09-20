@@ -1190,6 +1190,117 @@ pre {
   opacity: 0.7;
 }
 
+.usage-filter,
+.log-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--ink-soft);
+  font-size: .82rem;
+  font-weight: 650;
+}
+
+.usage-filter select,
+.log-actions select {
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--line-strong);
+  border-radius: 6px;
+  background: var(--glass-strong);
+  color: var(--ink);
+  font: inherit;
+}
+
+.logs-section {
+  padding: 25px 0;
+  border-bottom: 1px solid var(--line);
+}
+
+.log-table-head,
+.log-row {
+  display: grid;
+  grid-template-columns: minmax(150px, 1.2fr) minmax(180px, 2fr) 80px 100px 100px 80px;
+  gap: 16px;
+  align-items: center;
+}
+
+.log-table-head {
+  margin-top: 24px;
+  padding: 12px;
+  color: var(--ink-faint);
+  font-size: .72rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+}
+
+.log-row {
+  min-height: 64px;
+  padding: 10px 12px;
+  border-top: 1px solid var(--line);
+  color: var(--ink-soft);
+  font-size: .82rem;
+}
+
+.log-row time {
+  font-size: .76rem;
+  color: var(--ink-faint);
+}
+
+.log-endpoint {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.log-endpoint strong,
+.log-endpoint span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.log-endpoint strong {
+  color: var(--ink);
+  font-family: var(--mono);
+  font-size: .78rem;
+}
+
+.log-endpoint span {
+  color: var(--ink-faint);
+  font-family: var(--mono);
+  font-size: .72rem;
+}
+
+.log-status {
+  font-size: .78rem;
+  font-weight: 650;
+}
+
+.log-status.ok { color: var(--green); }
+.log-status.error { color: var(--orange); }
+.log-status.pending { color: var(--ink-faint); }
+
+@media(max-width:760px) {
+  .usage-section .section-bar,
+  .logs-section .section-bar { flex-direction: column; }
+  .usage-filter,
+  .log-actions { width: 100%; justify-content: space-between; }
+  .log-table-head { display: none; }
+  .log-row {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 7px 12px;
+    padding: 14px 0;
+  }
+  .log-row time { grid-column: 1; grid-row: 1; }
+  .log-row .log-endpoint { grid-column: 1; grid-row: 2; }
+  .log-row .log-status { grid-column: 2; grid-row: 1 / span 2; }
+  .log-row > span:nth-last-child(3),
+  .log-row > span:nth-last-child(2),
+  .log-row > span:last-child { font-size: .74rem; }
+}
+
 .usage-value {
   font-size: 2rem;
   font-weight: 700;

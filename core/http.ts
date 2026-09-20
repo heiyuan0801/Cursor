@@ -5,7 +5,7 @@ const JSON_HEADERS = {
 const CORS_HEADERS = {
   "access-control-allow-origin": "*",
   "access-control-allow-methods": "GET,POST,DELETE,OPTIONS",
-  "access-control-allow-headers": "authorization,content-type,x-api-key,idempotency-key,x-session-affinity,x-opencode-session-id,x-opencode-session",
+  "access-control-allow-headers": "authorization,content-type,x-api-key,idempotency-key,x-session-affinity,x-opencode-session-id,x-opencode-session,x-session-id",
   "access-control-max-age": "86400"
 };
 
@@ -70,12 +70,21 @@ export function bearerToken(request: Request): string | undefined {
   return apiKey?.trim() || undefined;
 }
 
-export function parseJsonBody<T = unknown>(request: Request): Promise<T> {
+export async function parseJsonBody<T = unknown>(request: Request): Promise<T> {
   const contentType = request.headers.get("content-type") || "";
   if (contentType && !contentType.toLowerCase().includes("application/json")) {
     throw new HttpError("Content-Type must be application/json", 415);
   }
-  return request.json() as Promise<T>;
+  let value: unknown;
+  try { value = await request.json(); }
+  catch (error) {
+    if (error instanceof SyntaxError) throw new HttpError("Invalid JSON body", 400);
+    throw error;
+  }
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    throw new HttpError("JSON body must be an object", 400);
+  }
+  return value as T;
 }
 
 export class HttpError extends Error {
@@ -96,8 +105,7 @@ export function errorResponse(error: unknown): Response {
   if (error instanceof HttpError) {
     return openAiError(error.message, error.status, error.code, error.param);
   }
-  const message = error instanceof Error ? error.message : "Unexpected error";
-  return openAiError(message, 500, "internal_error");
+  return openAiError("Internal server error", 500, "internal_error");
 }
 
 export function sseResponse(readable: ReadableStream<Uint8Array>): Response {

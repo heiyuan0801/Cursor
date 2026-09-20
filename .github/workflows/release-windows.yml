@@ -67,6 +67,10 @@ jobs:
       - name: Set up Bun
         uses: oven-sh/setup-bun@v2
 
+      - name: Install gateway dependencies
+        working-directory: .
+        run: npm ci
+
       - name: Install dependencies
         run: bun install
 

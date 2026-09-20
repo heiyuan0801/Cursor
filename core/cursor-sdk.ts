@@ -2,7 +2,13 @@ import { sha256Hex } from "./crypto";
 import { exchangeCursorApiKey } from "./cursor";
 import { HttpError } from "./http";
 import type { CursorCollectedOutput, CursorTextEvent } from "./cursor";
-import type { CursorImage, CursorToolCall, CursorTokenUsage, Deps, Env } from "./types";
+import type {
+  CursorImage,
+  CursorToolCall,
+  CursorTokenUsage,
+  Deps,
+  Env,
+} from "./types";
 
 interface CursorSdkSession {
   agentId: string;
@@ -67,7 +73,6 @@ interface ToolSpec {
   argsKind: ArgsKind;
 }
 
-const sdkSessions = new Map<string, CursorSdkSession>();
 const SDK_SESSION_TTL_MS = 6 * 60 * 60 * 1000;
 const AGENT_MODE_AGENT = 1;
 const DEFAULT_SDK_CLIENT_VERSION = "sdk-1.0.13";
@@ -95,7 +100,8 @@ export function isTransientCursorSdkError(error: unknown): boolean {
     const status = Number((value as Record<string, unknown>).status);
     return Number.isFinite(status) ? [status] : [];
   });
-  if (statuses.some((status) => [408, 429, 502, 503, 504].includes(status))) return true;
+  if (statuses.some((status) => [408, 429, 502, 503, 504].includes(status)))
+    return true;
 
   const text = values
     .flatMap((value) => {
@@ -104,30 +110,34 @@ export function isTransientCursorSdkError(error: unknown): boolean {
       const record = value as Record<string, unknown>;
       return [record.message, record.rawMessage, record.code, record.name];
     })
-    .filter((value): value is string | number => typeof value === "string" || typeof value === "number")
+    .filter(
+      (value): value is string | number =>
+        typeof value === "string" || typeof value === "number",
+    )
     .map((value) => String(value).toLowerCase());
 
-  return text.some((value) =>
-    value === "econnreset" ||
-    value === "epipe" ||
-    value === "etimedout" ||
-    value === "econnrefused" ||
-    value === "enetwork" ||
-    value === "und_err_socket" ||
-    value === "und_err_connect_timeout" ||
-    value === "err_stream_premature_close" ||
-    value === "cursor_sdk_timeout" ||
-    value === "cursor_sdk_bridge_timeout" ||
-    value.includes("socket connection was closed unexpectedly") ||
-    value.includes("socket hang up") ||
-    value.includes("connection reset") ||
-    value.includes("connection closed unexpectedly") ||
-    value.includes("premature close") ||
-    value.includes("fetch failed") ||
-    value.includes("network error") ||
-    value.includes("unable to connect") ||
-    value.includes("timed out") ||
-    value.includes("timeout")
+  return text.some(
+    (value) =>
+      value === "econnreset" ||
+      value === "epipe" ||
+      value === "etimedout" ||
+      value === "econnrefused" ||
+      value === "enetwork" ||
+      value === "und_err_socket" ||
+      value === "und_err_connect_timeout" ||
+      value === "err_stream_premature_close" ||
+      value === "cursor_sdk_timeout" ||
+      value === "cursor_sdk_bridge_timeout" ||
+      value.includes("socket connection was closed unexpectedly") ||
+      value.includes("socket hang up") ||
+      value.includes("connection reset") ||
+      value.includes("connection closed unexpectedly") ||
+      value.includes("premature close") ||
+      value.includes("fetch failed") ||
+      value.includes("network error") ||
+      value.includes("unable to connect") ||
+      value.includes("timed out") ||
+      value.includes("timeout"),
   );
 }
 
@@ -141,7 +151,7 @@ const TOOL_CALL_SPECS: Record<number, ToolSpec> = {
   13: { name: "ls", argsKind: "ls" },
   14: { name: "readLints", argsKind: "readLints" },
   15: { name: "mcp", argsKind: "mcp" },
-  16: { name: "semSearch", argsKind: "semSearch" }
+  16: { name: "semSearch", argsKind: "semSearch" },
 };
 
 const EXEC_TOOL_SPECS: Record<number, ToolSpec> = {
@@ -153,7 +163,7 @@ const EXEC_TOOL_SPECS: Record<number, ToolSpec> = {
   8: { name: "ls", argsKind: "ls" },
   9: { name: "readLints", argsKind: "readLints" },
   11: { name: "mcp", argsKind: "mcp" },
-  14: { name: "shell", argsKind: "shell" }
+  14: { name: "shell", argsKind: "shell" },
 };
 
 export async function createCursorSdkCompletion(
@@ -169,22 +179,36 @@ export async function createCursorSdkCompletion(
     clientTools?: ClientToolSpec[];
     requiresLocalTool?: boolean;
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+    /** Prefer incremental bridge events when the API response itself is streaming. */
+    stream?: boolean;
     // Optional delta for a follow-up turn. When the bridge's agent for this session is
     // still cached, the bridge sends only this (the new turn) instead of re-feeding the
     // full prompt; if the agent was evicted it falls back to `prompt`, so this is safe.
     incrementalPrompt?: { text: string; images?: CursorImage[] };
-  }
+  },
 ): Promise<CursorSdkCompletion> {
-  const now = deps.now();
-  pruneSessions(now.getTime());
-  const sessionIdentity = await sdkSessionIdentity(apiKey, input.sessionKey || "default", input.sessionOwnerKey);
-  const session = sdkSessions.get(sessionIdentity.id) ?? (await readPersistedSdkSession(env, sessionIdentity.id, now.getTime()));
+  const store = env.SDK_SESSION_STORE;
+  if (!store)
+    throw new HttpError(
+      "Shared SDK session store is required",
+      503,
+      "session_store_missing",
+    );
+  const sessionIdentity = await sdkSessionIdentity(
+    apiKey,
+    input.sessionKey || "default",
+    input.sessionOwnerKey,
+  );
+  const session = await store.get(sessionIdentity.id);
   const agentId = session?.agentId || newLocalSdkAgentId(deps.randomUUID());
   const runId = newLocalSdkRunId(deps.randomUUID());
   const updatedAt = deps.now();
 
-  sdkSessions.set(sessionIdentity.id, { agentId, updatedAt: updatedAt.getTime() });
-  await savePersistedSdkSession(env, sessionIdentity, agentId, updatedAt);
+  await store.set(
+    sessionIdentity.id,
+    { agentId, updatedAt: updatedAt.getTime() },
+    SDK_SESSION_TTL_MS / 1000,
+  );
 
   const runInput = {
     agentId,
@@ -196,14 +220,21 @@ export async function createCursorSdkCompletion(
     clientTools: input.clientTools,
     requiresLocalTool: input.requiresLocalTool === true,
     allowToolCall: input.allowToolCall,
-    incrementalPrompt: input.incrementalPrompt ? sdkPrompt(input.incrementalPrompt) : undefined
+    incrementalPrompt: input.incrementalPrompt
+      ? sdkPrompt(input.incrementalPrompt)
+      : undefined,
   };
 
   if (hasCursorSdkBridge(env)) {
+    // Tool-call retry needs to see a complete turn before deciding whether to rerun.
+    // Do not emit partial output for those requests.
+    const canStream = input.stream === true && input.requiresLocalTool !== true;
     return {
       agentId,
       runId,
-      stream: streamCursorLocalSdkBridgeRunWithRetry(env, deps, apiKey, runInput)
+      stream: canStream
+        ? streamCursorLocalSdkBridgeEventsWithRetry(env, deps, apiKey, runInput)
+        : streamCursorLocalSdkBridgeRunWithRetry(env, deps, apiKey, runInput),
     };
   }
 
@@ -211,11 +242,13 @@ export async function createCursorSdkCompletion(
   return {
     agentId,
     runId,
-    stream: streamCursorLocalSdkRunWithRetry(env, deps, accessToken, runInput)
+    stream: streamCursorLocalSdkRunWithRetry(env, deps, accessToken, runInput),
   };
 }
 
-export async function collectCursorSdkOutput(stream: AsyncIterable<CursorTextEvent>): Promise<CursorCollectedOutput> {
+export async function collectCursorSdkOutput(
+  stream: AsyncIterable<CursorTextEvent>,
+): Promise<CursorCollectedOutput> {
   let text = "";
   let toolCalls: CursorToolCall[] = [];
   let usage: CursorTokenUsage | undefined;
@@ -231,10 +264,6 @@ export async function collectCursorSdkOutput(stream: AsyncIterable<CursorTextEve
   return { text, toolCalls, usage };
 }
 
-export function resetCursorSdkSessionCacheForTest() {
-  sdkSessions.clear();
-}
-
 export const cursorSdkTestExports = {
   decodeLocalAgentServerFrame,
   encodeAgentClientRequestContextResult,
@@ -242,7 +271,7 @@ export const cursorSdkTestExports = {
   isEmittableSdkToolCall,
   normalizeSdkToolCallForOpenCode,
   retryPromptAfterMissingTool,
-  retryPromptAfterUnsupportedTool
+  retryPromptAfterUnsupportedTool,
 };
 
 async function* streamCursorLocalSdkRun(
@@ -257,7 +286,7 @@ async function* streamCursorLocalSdkRun(
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
-  }
+  },
 ): AsyncGenerator<CursorTextEvent> {
   let text = "";
   const toolCalls: CursorToolCall[] = [];
@@ -268,8 +297,8 @@ async function* streamCursorLocalSdkRun(
       agentId: input.agentId,
       messageId: input.runId,
       modelId: input.modelId,
-      prompt: input.prompt
-    })
+      prompt: input.prompt,
+    }),
   );
   const runAbort = new AbortController();
   const upload = new TransformStream<Uint8Array, Uint8Array>();
@@ -281,10 +310,10 @@ async function* streamCursorLocalSdkRun(
     accessToken,
     requestId,
     upload.readable,
-    runAbort.signal
+    runAbort.signal,
   ).then((response) => ({
     source: "run" as const,
-    response
+    response,
   }));
   let uploadOpen = false;
   if (uploadWriter) {
@@ -307,7 +336,11 @@ async function* streamCursorLocalSdkRun(
           }
           const decision = input.allowToolCall?.(event.toolCall) ?? true;
           if (decision !== true) {
-            yield { type: "rejected_tool_call", toolCall: event.toolCall, reason: typeof decision === "string" ? decision : undefined };
+            yield {
+              type: "rejected_tool_call",
+              toolCall: event.toolCall,
+              reason: typeof decision === "string" ? decision : undefined,
+            };
             yield { type: "done", finalText: text, toolCalls };
             return;
           }
@@ -320,7 +353,14 @@ async function* streamCursorLocalSdkRun(
           }
         } else if (event.type === "request_context") {
           if (uploadOpen && uploadWriter) {
-            await writeSdkUpload(uploadWriter, encodeConnectFrame(encodeAgentClientRequestContextResult(event, { workingDirectory: input.workingDirectory })));
+            await writeSdkUpload(
+              uploadWriter,
+              encodeConnectFrame(
+                encodeAgentClientRequestContextResult(event, {
+                  workingDirectory: input.workingDirectory,
+                }),
+              ),
+            );
           }
         } else if (event.type === "done") {
           yield { type: "done", finalText: text, toolCalls };
@@ -350,7 +390,7 @@ async function* streamCursorLocalSdkRunWithRetry(
     requiresLocalTool: boolean;
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
     incrementalPrompt?: string;
-  }
+  },
 ): AsyncGenerator<CursorTextEvent> {
   if (!input.requiresLocalTool && !input.allowToolCall) {
     yield* streamCursorLocalSdkRun(env, deps, accessToken, input);
@@ -364,7 +404,12 @@ async function* streamCursorLocalSdkRunWithRetry(
     let sawToolCall = false;
     let rejectedToolCall: CursorToolCall | undefined;
     let rejectedToolReason: string | undefined;
-    for await (const event of streamCursorLocalSdkRun(env, deps, accessToken, attemptInput)) {
+    for await (const event of streamCursorLocalSdkRun(
+      env,
+      deps,
+      accessToken,
+      attemptInput,
+    )) {
       events.push(event);
       if (event.type === "tool_call") sawToolCall = true;
       if (event.type === "rejected_tool_call") {
@@ -385,8 +430,18 @@ async function* streamCursorLocalSdkRunWithRetry(
       ...input,
       runId: newLocalSdkRunId(deps.randomUUID()),
       prompt: rejectedToolCall
-        ? retryPromptAfterUnsupportedTool(input.prompt, rejectedToolCall, rejectedToolReason, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
-        : retryPromptAfterMissingTool(input.prompt, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
+        ? retryPromptAfterUnsupportedTool(
+            input.prompt,
+            rejectedToolCall,
+            rejectedToolReason,
+            attempt + 1,
+            SDK_TOOL_RETRY_ATTEMPTS,
+          )
+        : retryPromptAfterMissingTool(
+            input.prompt,
+            attempt + 1,
+            SDK_TOOL_RETRY_ATTEMPTS,
+          ),
     };
   }
 
@@ -406,26 +461,35 @@ async function* streamCursorLocalSdkBridgeRun(
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
-  }
+  },
 ): AsyncGenerator<CursorTextEvent> {
   const output = await cursorLocalSdkBridgeJson(env, deps, apiKey, input);
+  yield* bridgeOutputAsEvents(output, input.allowToolCall);
+}
+
+/** Convert a completed bridge response into the event shape used by all consumers. */
+function* bridgeOutputAsEvents(
+  output: CursorSdkBridgeOutput,
+  allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision,
+): Generator<CursorTextEvent> {
   const text = typeof output.text === "string" ? output.text : "";
   const toolCalls: CursorToolCall[] = [];
-  const rawToolCalls = Array.isArray(output.toolCalls) ? output.toolCalls : [];
   const usage = output.usage;
 
   if (text) yield { type: "text", text };
 
-  for (const rawToolCall of rawToolCalls) {
-    if (!rawToolCall || typeof rawToolCall.name !== "string") continue;
-    const toolCall = normalizeSdkToolCallForOpenCode({
-      name: rawToolCall.name,
-      arguments: isRecord(rawToolCall.arguments) ? rawToolCall.arguments : {}
-    });
-    if (!isEmittableSdkToolCall(toolCall)) continue;
-    const decision = input.allowToolCall?.(toolCall) ?? true;
+  for (const rawToolCall of Array.isArray(output.toolCalls)
+    ? output.toolCalls
+    : []) {
+    const toolCall = emittableBridgeToolCall(rawToolCall);
+    if (!toolCall) continue;
+    const decision = allowToolCall?.(toolCall) ?? true;
     if (decision !== true) {
-      yield { type: "rejected_tool_call", toolCall, reason: typeof decision === "string" ? decision : undefined };
+      yield {
+        type: "rejected_tool_call",
+        toolCall,
+        reason: typeof decision === "string" ? decision : undefined,
+      };
       yield { type: "done", finalText: text, toolCalls, usage };
       return;
     }
@@ -436,6 +500,15 @@ async function* streamCursorLocalSdkBridgeRun(
   }
 
   yield { type: "done", finalText: text, toolCalls, usage };
+}
+
+function emittableBridgeToolCall(value: unknown): CursorToolCall | undefined {
+  if (!isRecord(value) || typeof value.name !== "string") return undefined;
+  const toolCall = normalizeSdkToolCallForOpenCode({
+    name: value.name,
+    arguments: isRecord(value.arguments) ? value.arguments : {},
+  });
+  return isEmittableSdkToolCall(toolCall) ? toolCall : undefined;
 }
 
 async function* streamCursorLocalSdkBridgeRunWithRetry(
@@ -453,7 +526,7 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
     requiresLocalTool: boolean;
     allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
     incrementalPrompt?: string;
-  }
+  },
 ): AsyncGenerator<CursorTextEvent> {
   let attemptInput = input;
   let lastEvents: CursorTextEvent[] = [];
@@ -463,7 +536,12 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
     let rejectedToolCall: CursorToolCall | undefined;
     let rejectedToolReason: string | undefined;
     try {
-      for await (const event of streamCursorLocalSdkBridgeRun(env, deps, apiKey, attemptInput)) {
+      for await (const event of streamCursorLocalSdkBridgeRun(
+        env,
+        deps,
+        apiKey,
+        attemptInput,
+      )) {
         events.push(event);
         if (event.type === "tool_call") sawToolCall = true;
         if (event.type === "rejected_tool_call") {
@@ -472,10 +550,14 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
         }
       }
     } catch (error) {
-      if (events.length === 0 && attempt < SDK_TOOL_RETRY_ATTEMPTS && isTransientCursorSdkError(error)) {
+      if (
+        events.length === 0 &&
+        attempt < SDK_TOOL_RETRY_ATTEMPTS &&
+        isTransientCursorSdkError(error)
+      ) {
         attemptInput = {
           ...input,
-          runId: newLocalSdkRunId(deps.randomUUID())
+          runId: newLocalSdkRunId(deps.randomUUID()),
         };
         continue;
       }
@@ -494,15 +576,29 @@ async function* streamCursorLocalSdkBridgeRunWithRetry(
       ...input,
       runId: newLocalSdkRunId(deps.randomUUID()),
       prompt: rejectedToolCall
-        ? retryPromptAfterUnsupportedTool(input.prompt, rejectedToolCall, rejectedToolReason, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
-        : retryPromptAfterMissingTool(input.prompt, attempt + 1, SDK_TOOL_RETRY_ATTEMPTS)
+        ? retryPromptAfterUnsupportedTool(
+            input.prompt,
+            rejectedToolCall,
+            rejectedToolReason,
+            attempt + 1,
+            SDK_TOOL_RETRY_ATTEMPTS,
+          )
+        : retryPromptAfterMissingTool(
+            input.prompt,
+            attempt + 1,
+            SDK_TOOL_RETRY_ATTEMPTS,
+          ),
     };
   }
 
   for (const event of lastEvents) yield event;
 }
 
-function retryPromptAfterMissingTool(prompt: string, attempt = 2, maxAttempts = SDK_TOOL_RETRY_ATTEMPTS): string {
+function retryPromptAfterMissingTool(
+  prompt: string,
+  attempt = 2,
+  maxAttempts = SDK_TOOL_RETRY_ATTEMPTS,
+): string {
   return [
     prompt,
     "",
@@ -511,7 +607,7 @@ function retryPromptAfterMissingTool(prompt: string, attempt = 2, maxAttempts = 
     "The next response is invalid unless it contains a tool_call.",
     "Do not answer in prose. Emit exactly one SDK tool call now using the allowed OpenCode tool inventory above, then wait for the local tool result.",
     "Use SDK mcp for an exact client tool route, or SDK shell/write when the routing map says those built-ins map to the client schema.",
-    "If a specific client tool was named in the request, use that exact tool mapping and do not substitute shell, glob, or prose."
+    "If a specific client tool was named in the request, use that exact tool mapping and do not substitute shell, glob, or prose.",
   ].join("\n");
 }
 
@@ -520,7 +616,7 @@ function retryPromptAfterUnsupportedTool(
   toolCall: CursorToolCall,
   reason?: string,
   attempt = 2,
-  maxAttempts = SDK_TOOL_RETRY_ATTEMPTS
+  maxAttempts = SDK_TOOL_RETRY_ATTEMPTS,
 ): string {
   return [
     prompt,
@@ -531,7 +627,7 @@ function retryPromptAfterUnsupportedTool(
     "The next response is invalid unless it contains a mappable tool_call.",
     "Do not answer in prose. Emit exactly one SDK tool call that maps to an allowed client tool.",
     "For filesystem mutations, prefer SDK write with path and fileText or SDK shell with command when those capabilities are present.",
-    "For OpenCode MCP/server tools exposed as provider_tool names, use SDK mcp with providerIdentifier, toolName, and args."
+    "For OpenCode MCP/server tools exposed as provider_tool names, use SDK mcp with providerIdentifier, toolName, and args.",
   ].join("\n");
 }
 
@@ -542,31 +638,61 @@ async function cursorLocalSdkRaw(
   accessToken: string,
   requestId: string,
   body: BodyInit,
-  signal?: AbortSignal
+  signal?: AbortSignal,
 ): Promise<Response> {
   const base = env.CURSOR_BACKEND_BASE_URL?.trim();
-  if (!base) throw new HttpError("Cursor backend URL is not configured", 500, "cursor_missing_backend_url");
-  const url = /^https?:\/\//.test(endpoint) ? endpoint : `${base.replace(/\/$/, "")}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
+  if (!base)
+    throw new HttpError(
+      "Cursor backend URL is not configured",
+      500,
+      "cursor_missing_backend_url",
+    );
+  const url = /^https?:\/\//.test(endpoint)
+    ? endpoint
+    : `${base.replace(/\/$/, "")}${endpoint.startsWith("/") ? endpoint : `/${endpoint}`}`;
   const headers = new Headers({
     Authorization: `Bearer ${accessToken}`,
     "Connect-Protocol-Version": "1",
     "Content-Type": "application/connect+proto",
     "User-Agent": "connect-es/1.6.1",
     "x-cursor-client-type": "sdk",
-    "x-cursor-client-version": env.CURSOR_SDK_CLIENT_VERSION || DEFAULT_SDK_CLIENT_VERSION,
+    "x-cursor-client-version":
+      env.CURSOR_SDK_CLIENT_VERSION || DEFAULT_SDK_CLIENT_VERSION,
     "x-ghost-mode": "true",
     "x-original-request-id": requestId,
-    "x-request-id": requestId
+    "x-request-id": requestId,
   });
-  const init: RequestInit & { duplex?: "half" } = { method: "POST", headers, body, signal };
+  const init: RequestInit & { duplex?: "half" } = {
+    method: "POST",
+    headers,
+    body,
+    signal,
+  };
   if (body instanceof ReadableStream) init.duplex = "half";
   const response = await deps.fetch(url, init);
   if (!response.ok) {
     const text = await response.text().catch(() => "");
     const parsed = parseCursorSdkError(text);
-    const message = response.status === 401 ? "Invalid Cursor API key" : parsed.message || `Cursor local SDK request failed with status ${response.status}`;
-    const status = response.status === 401 ? 401 : response.status === 429 ? 429 : response.status >= 500 ? 502 : 400;
-    throw new HttpError(message, status, response.status === 401 ? "cursor_unauthorized" : parsed.code || "cursor_sdk_error");
+    const message =
+      response.status === 401
+        ? "Invalid Cursor API key"
+        : parsed.message ||
+          `Cursor local SDK request failed with status ${response.status}`;
+    const status =
+      response.status === 401
+        ? 401
+        : response.status === 429
+          ? 429
+          : response.status >= 500
+            ? 502
+            : 400;
+    throw new HttpError(
+      message,
+      status,
+      response.status === 401
+        ? "cursor_unauthorized"
+        : parsed.code || "cursor_sdk_error",
+    );
   }
   return response;
 }
@@ -584,9 +710,41 @@ async function cursorLocalSdkBridgeJson(
     workingDirectory?: string;
     clientTools?: ClientToolSpec[];
     incrementalPrompt?: string;
-  }
+  },
 ): Promise<CursorSdkBridgeOutput> {
-  const body = JSON.stringify({
+  const body = cursorLocalSdkBridgeBody(apiKey, input, false);
+  const response = await withCursorLocalSdkBridgeTimeout(
+    env,
+    (signal) =>
+      cursorLocalSdkBridgeFetch(env, deps, body, signal) ??
+      Promise.resolve(undefined),
+  );
+  if (!response)
+    throw new HttpError(
+      "Cursor SDK bridge is not configured",
+      500,
+      "cursor_sdk_bridge_missing",
+    );
+  return parseCursorLocalSdkBridgeJsonResponse(response);
+}
+
+interface CursorLocalSdkBridgeInput {
+  agentId: string;
+  runId: string;
+  sessionKey: string;
+  prompt: string;
+  modelId: string;
+  workingDirectory?: string;
+  clientTools?: ClientToolSpec[];
+  incrementalPrompt?: string;
+}
+
+function cursorLocalSdkBridgeBody(
+  apiKey: string,
+  input: CursorLocalSdkBridgeInput,
+  streamEvents: boolean,
+): string {
+  return JSON.stringify({
     apiKey,
     requestId: input.runId,
     model: input.modelId,
@@ -594,44 +752,325 @@ async function cursorLocalSdkBridgeJson(
     incrementalPrompt: input.incrementalPrompt,
     sessionKey: input.sessionKey || input.agentId,
     workingDirectory: sdkWorkingDirectory(input.workingDirectory),
-    tools: bridgeClientTools(input.clientTools)
+    tools: bridgeClientTools(input.clientTools),
+    ...(streamEvents ? { streamEvents: true } : {}),
   });
-  const bridgeBinding = env.CURSOR_SDK_BRIDGE_CONTAINER;
-  const bridgeUrl = env.CURSOR_SDK_BRIDGE_URL?.trim();
-  const response = await withCursorLocalSdkBridgeTimeout(env, (signal) =>
-    bridgeBinding
-      ? cursorLocalSdkContainerBridgeJson(env, bridgeBinding, body, signal)
-      : bridgeUrl
-        ? cursorLocalSdkUrlBridgeJson(env, deps, bridgeUrl, body, signal)
-        : Promise.resolve(undefined)
-  );
-  if (!response) throw new HttpError("Cursor SDK bridge is not configured", 500, "cursor_sdk_bridge_missing");
-  return parseCursorLocalSdkBridgeJsonResponse(response);
 }
 
-async function cursorLocalSdkUrlBridgeJson(env: Env, deps: Deps, bridgeUrl: string, body: string, signal?: AbortSignal): Promise<Response> {
+function cursorLocalSdkBridgeFetch(
+  env: Env,
+  deps: Deps,
+  body: string,
+  signal?: AbortSignal,
+): Promise<Response> | undefined {
+  const bridgeUrl = env.CURSOR_SDK_BRIDGE_URL?.trim();
+  return bridgeUrl
+    ? cursorLocalSdkUrlBridgeJson(env, deps, bridgeUrl, body, signal)
+    : undefined;
+}
+
+async function* streamCursorLocalSdkBridgeEvents(
+  env: Env,
+  deps: Deps,
+  apiKey: string,
+  input: CursorLocalSdkBridgeInput & {
+    allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+  },
+): AsyncGenerator<CursorTextEvent> {
+  const body = cursorLocalSdkBridgeBody(apiKey, input, true);
+  const controller = new AbortController();
+  const response = await withCursorLocalSdkBridgeTimeout(env, (signal) => {
+    signal.addEventListener("abort", () => controller.abort(signal.reason), {
+      once: true,
+    });
+    return (
+      cursorLocalSdkBridgeFetch(env, deps, body, controller.signal) ??
+      Promise.resolve(undefined)
+    );
+  });
+  if (!response)
+    throw new HttpError(
+      "Cursor SDK bridge is not configured",
+      500,
+      "cursor_sdk_bridge_missing",
+    );
+  if (!response.ok) await parseCursorLocalSdkBridgeJsonResponse(response);
+  if (!response.headers.get("content-type")?.includes("ndjson")) {
+    yield* bridgeOutputAsEvents(
+      await parseCursorLocalSdkBridgeJsonResponse(response),
+      input.allowToolCall,
+    );
+    return;
+  }
+  if (!response.body)
+    throw new HttpError(
+      "Cursor SDK bridge returned an empty stream",
+      502,
+      "cursor_sdk_bridge_error",
+    );
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const gate = new SdkBridgeTextGate();
+  const toolCalls: CursorToolCall[] = [];
+  let streamedText = "";
+  let buffer = "";
+  let sawDone = false;
+  try {
+    for (;;) {
+      const result = await readWithIdleTimeout(
+        reader,
+        cursorLocalSdkBridgeTimeoutMs(env),
+        controller,
+      );
+      if (result.done) {
+        // Flush a partial UTF-8 code point before deciding whether the bridge
+        // closed cleanly. The SDK can emit non-ASCII answer text at chunk
+        // boundaries, and TextDecoder keeps that byte sequence pending.
+        buffer += decoder.decode();
+        break;
+      }
+      buffer += decoder.decode(result.value, { stream: true });
+      for (
+        let newline = buffer.indexOf("\n");
+        newline >= 0;
+        newline = buffer.indexOf("\n")
+      ) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        let event: unknown;
+        try {
+          event = JSON.parse(line);
+        } catch {
+          throw new HttpError(
+            "Cursor SDK bridge returned invalid JSON",
+            502,
+            "cursor_sdk_bridge_invalid_json",
+          );
+        }
+        if (!isRecord(event)) continue;
+        if (event.type === "text" && typeof event.text === "string") {
+          const safe = gate.push(event.text);
+          if (safe) {
+            streamedText += safe;
+            yield { type: "text", text: safe };
+          }
+          continue;
+        }
+        if (event.type === "tool_call") {
+          const toolCall = emittableBridgeToolCall(event.toolCall);
+          if (!toolCall) continue;
+          const decision = input.allowToolCall?.(toolCall) ?? true;
+          if (decision !== true) {
+            yield {
+              type: "rejected_tool_call",
+              toolCall,
+              reason: typeof decision === "string" ? decision : undefined,
+            };
+            sawDone = true;
+            yield {
+              type: "done",
+              finalText: streamedText + gate.flush(),
+              toolCalls,
+            };
+            break;
+          }
+          toolCalls.push(toolCall);
+          yield { type: "tool_call", toolCall };
+          continue;
+        }
+        if (event.type === "error") throw bridgeStreamError(event.error);
+        if (event.type === "done") {
+          const output = cursorLocalSdkBridgeOutputFromJson(event.output);
+          const tail = gate.flush();
+          if (tail) {
+            streamedText += tail;
+            yield { type: "text", text: tail };
+          }
+          sawDone = true;
+          yield {
+            type: "done",
+            finalText: output.text || streamedText,
+            toolCalls: toolCalls.length ? toolCalls : output.toolCalls || [],
+            usage: output.usage,
+          };
+          break;
+        }
+      }
+      if (sawDone) break;
+    }
+  } finally {
+    reader.cancel().catch(() => undefined);
+    controller.abort();
+  }
+  if (!sawDone)
+    throw new HttpError(
+      "Cursor SDK bridge closed the stream unexpectedly",
+      502,
+      "cursor_sdk_bridge_error",
+    );
+}
+
+async function* streamCursorLocalSdkBridgeEventsWithRetry(
+  env: Env,
+  deps: Deps,
+  apiKey: string,
+  input: CursorLocalSdkBridgeInput & {
+    requiresLocalTool: boolean;
+    allowToolCall?: (toolCall: CursorToolCall) => ToolCallDecision;
+  },
+): AsyncGenerator<CursorTextEvent> {
+  let attemptInput = input;
+  for (let attempt = 1; ; attempt += 1) {
+    let emitted = false;
+    try {
+      for await (const event of streamCursorLocalSdkBridgeEvents(
+        env,
+        deps,
+        apiKey,
+        attemptInput,
+      )) {
+        emitted = true;
+        yield event;
+      }
+      return;
+    } catch (error) {
+      if (
+        emitted ||
+        attempt >= SDK_TOOL_RETRY_ATTEMPTS ||
+        !isTransientCursorSdkError(error)
+      )
+        throw error;
+      attemptInput = { ...input, runId: newLocalSdkRunId(deps.randomUUID()) };
+    }
+  }
+}
+
+async function readWithIdleTimeout(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  idleMs: number,
+  controller: AbortController,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const idle = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const error = new HttpError(
+        "Cursor SDK bridge stream stalled.",
+        504,
+        "cursor_sdk_bridge_timeout",
+      );
+      reject(error);
+      controller.abort(error);
+    }, idleMs);
+  });
+  try {
+    return await Promise.race([reader.read(), idle]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function bridgeStreamError(value: unknown): HttpError {
+  const error = isRecord(value) ? value : {};
+  const message =
+    typeof error.message === "string" && error.message
+      ? error.message
+      : "Cursor SDK bridge reported a stream error";
+  const code =
+    typeof error.code === "string" && error.code
+      ? error.code
+      : "cursor_sdk_bridge_error";
+  return new HttpError(message, 502, code);
+}
+
+function cursorLocalSdkBridgeOutputFromJson(
+  value: unknown,
+): CursorSdkBridgeOutput {
+  if (!isRecord(value)) return { text: "", toolCalls: [] };
+  return {
+    text: typeof value.text === "string" ? value.text : "",
+    toolCalls: Array.isArray(value.toolCalls)
+      ? value.toolCalls.flatMap((raw) => emittableBridgeToolCall(raw) ?? [])
+      : [],
+    agentID: typeof value.agentID === "string" ? value.agentID : undefined,
+    runID: typeof value.runID === "string" ? value.runID : undefined,
+    status: typeof value.status === "string" ? value.status : undefined,
+    usage: cursorTokenUsageFromJson(value.usage),
+    agentCached: value.agentCached === true,
+  };
+}
+
+const SDK_BRIDGE_TOOL_CALLS_MARKER = "<|tool_calls_begin|>";
+const SDK_BRIDGE_TEXT_MARKERS = [
+  SDK_BRIDGE_TOOL_CALLS_MARKER,
+  "<final_answer>",
+  "</final_answer>",
+  "<answer>",
+  "</answer>",
+];
+
+/** Hold a possible split control marker so it never leaks into client-visible output. */
+class SdkBridgeTextGate {
+  private pending = "";
+  private blocked = false;
+  push(chunk: string): string {
+    if (this.blocked) return "";
+    this.pending += chunk;
+    const marker = this.pending.indexOf(SDK_BRIDGE_TOOL_CALLS_MARKER);
+    if (marker >= 0) {
+      this.blocked = true;
+      const safe = this.pending.slice(0, marker);
+      this.pending = "";
+      return safe;
+    }
+    const hold = heldMarkerSuffixLength(this.pending);
+    const safe = this.pending.slice(0, this.pending.length - hold);
+    this.pending = this.pending.slice(this.pending.length - hold);
+    return safe;
+  }
+  flush(): string {
+    if (this.blocked) return "";
+    const safe = this.pending.replace(
+      /\s*<\/?(?:final_answer|answer)>\s*$/i,
+      "",
+    );
+    this.pending = "";
+    return safe;
+  }
+}
+
+function heldMarkerSuffixLength(text: string): number {
+  const longest = Math.min(
+    text.length,
+    Math.max(...SDK_BRIDGE_TEXT_MARKERS.map((marker) => marker.length)),
+  );
+  for (let length = longest; length > 0; length -= 1) {
+    const suffix = text.slice(text.length - length);
+    if (SDK_BRIDGE_TEXT_MARKERS.some((marker) => marker.startsWith(suffix)))
+      return length;
+  }
+  return 0;
+}
+
+async function cursorLocalSdkUrlBridgeJson(
+  env: Env,
+  deps: Deps,
+  bridgeUrl: string,
+  body: string,
+  signal?: AbortSignal,
+): Promise<Response> {
   return deps.fetch(bridgeUrl, {
     method: "POST",
     headers: cursorLocalSdkBridgeHeaders(env),
     body,
-    signal
-  });
-}
-
-async function cursorLocalSdkContainerBridgeJson(env: Env, bridgeBinding: DurableObjectNamespace, body: string, signal?: AbortSignal): Promise<Response> {
-  const bridgeId = bridgeBinding.idFromName("shared");
-  const bridge = bridgeBinding.get(bridgeId);
-  return bridge.fetch("http://cursor-sdk-bridge.local/sdk", {
-    method: "POST",
-    headers: cursorLocalSdkBridgeHeaders(env),
-    body,
-    signal
+    signal,
   });
 }
 
 async function withCursorLocalSdkBridgeTimeout<T>(
   env: Env,
-  run: (signal: AbortSignal) => Promise<T>
+  run: (signal: AbortSignal) => Promise<T>,
 ): Promise<T> {
   const controller = new AbortController();
   const timeoutMs = cursorLocalSdkBridgeTimeoutMs(env);
@@ -639,7 +1078,11 @@ async function withCursorLocalSdkBridgeTimeout<T>(
   const work = run(controller.signal);
   const timeout = new Promise<never>((_resolve, reject) => {
     timer = setTimeout(() => {
-      const error = new HttpError("Cursor SDK bridge request timed out.", 504, "cursor_sdk_bridge_timeout");
+      const error = new HttpError(
+        "Cursor SDK bridge request timed out.",
+        504,
+        "cursor_sdk_bridge_timeout",
+      );
       reject(error);
       controller.abort(error);
     }, timeoutMs);
@@ -654,41 +1097,67 @@ async function withCursorLocalSdkBridgeTimeout<T>(
 
 function cursorLocalSdkBridgeTimeoutMs(env: Env): number {
   const value = Number.parseInt(env.CURSOR_SDK_BRIDGE_TIMEOUT_MS || "", 10);
-  return Number.isFinite(value) && value > 0 ? value : DEFAULT_SDK_BRIDGE_REQUEST_TIMEOUT_MS;
+  return Number.isFinite(value) && value > 0
+    ? value
+    : DEFAULT_SDK_BRIDGE_REQUEST_TIMEOUT_MS;
 }
 
-async function parseCursorLocalSdkBridgeJsonResponse(response: Response): Promise<CursorSdkBridgeOutput> {
+async function parseCursorLocalSdkBridgeJsonResponse(
+  response: Response,
+): Promise<CursorSdkBridgeOutput> {
   const text = await response.text().catch(() => "");
   let object: unknown;
   if (text.trim()) {
     try {
       object = JSON.parse(text);
     } catch {
-      throw new HttpError("Cursor SDK bridge returned invalid JSON", 502, "cursor_sdk_bridge_invalid_json");
+      throw new HttpError(
+        "Cursor SDK bridge returned invalid JSON",
+        502,
+        "cursor_sdk_bridge_invalid_json",
+      );
     }
   } else {
     object = {};
   }
   if (!response.ok) {
-    const error = isRecord(object) && isRecord(object.error) ? object.error : undefined;
-    const message = typeof error?.message === "string" && error.message
-      ? error.message
-      : `Cursor SDK bridge failed with status ${response.status}`;
-    const code = typeof error?.code === "string" && error.code ? error.code : "cursor_sdk_bridge_error";
-    const status = response.status === 401 ? 502 : response.status === 429 ? 429 : response.status >= 500 ? 502 : 400;
+    const error =
+      isRecord(object) && isRecord(object.error) ? object.error : undefined;
+    const message =
+      typeof error?.message === "string" && error.message
+        ? error.message
+        : `Cursor SDK bridge failed with status ${response.status}`;
+    const code =
+      typeof error?.code === "string" && error.code
+        ? error.code
+        : "cursor_sdk_bridge_error";
+    const status =
+      response.status === 401
+        ? 502
+        : response.status === 429
+          ? 429
+          : response.status >= 500
+            ? 502
+            : 400;
     throw new HttpError(message, status, code);
   }
   if (!isRecord(object)) {
-    throw new HttpError("Cursor SDK bridge returned invalid JSON", 502, "cursor_sdk_bridge_invalid_json");
+    throw new HttpError(
+      "Cursor SDK bridge returned invalid JSON",
+      502,
+      "cursor_sdk_bridge_invalid_json",
+    );
   }
   return {
     text: typeof object.text === "string" ? object.text : "",
-    toolCalls: Array.isArray(object.toolCalls) ? object.toolCalls.flatMap(cursorToolCallFromJson) : [],
+    toolCalls: Array.isArray(object.toolCalls)
+      ? object.toolCalls.flatMap(cursorToolCallFromJson)
+      : [],
     agentID: typeof object.agentID === "string" ? object.agentID : undefined,
     runID: typeof object.runID === "string" ? object.runID : undefined,
     status: typeof object.status === "string" ? object.status : undefined,
     usage: cursorTokenUsageFromJson(object.usage),
-    agentCached: object.agentCached === true
+    agentCached: object.agentCached === true,
   };
 }
 
@@ -697,7 +1166,9 @@ async function parseCursorLocalSdkBridgeJsonResponse(response: Response): Promis
  * every field is validated and the whole thing degrades to undefined rather than reporting
  * zeroed-out token counts as if they were real.
  */
-export function cursorTokenUsageFromJson(value: unknown): CursorTokenUsage | undefined {
+export function cursorTokenUsageFromJson(
+  value: unknown,
+): CursorTokenUsage | undefined {
   if (!isRecord(value)) return undefined;
   const count = (field: unknown): number => {
     const numeric = Number(field);
@@ -709,7 +1180,9 @@ export function cursorTokenUsageFromJson(value: unknown): CursorTokenUsage | und
   const cacheWriteTokens = count(value.cacheWriteTokens);
   const reasoningTokens = count(value.reasoningTokens);
   const reportedTotal = count(value.totalTokens);
-  const totalTokens = reportedTotal || inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
+  const totalTokens =
+    reportedTotal ||
+    inputTokens + outputTokens + cacheReadTokens + cacheWriteTokens;
   if (totalTokens === 0) return undefined;
   return {
     inputTokens,
@@ -717,51 +1190,70 @@ export function cursorTokenUsageFromJson(value: unknown): CursorTokenUsage | und
     cacheReadTokens,
     cacheWriteTokens,
     totalTokens,
-    ...(reasoningTokens ? { reasoningTokens } : {})
+    ...(reasoningTokens ? { reasoningTokens } : {}),
   };
 }
 
 function cursorToolCallFromJson(value: unknown): CursorToolCall[] {
-  if (!isRecord(value) || typeof value.name !== "string" || !value.name.trim()) return [];
-  return [{
-    name: value.name.trim(),
-    arguments: isRecord(value.arguments) ? value.arguments : {}
-  }];
+  if (!isRecord(value) || typeof value.name !== "string" || !value.name.trim())
+    return [];
+  return [
+    {
+      name: value.name.trim(),
+      arguments: isRecord(value.arguments) ? value.arguments : {},
+    },
+  ];
 }
 
 function hasCursorSdkBridge(env: Env): boolean {
-  return Boolean(env.CURSOR_SDK_BRIDGE_CONTAINER || env.CURSOR_SDK_BRIDGE_URL?.trim());
+  return Boolean(env.CURSOR_SDK_BRIDGE_URL?.trim());
 }
 
-function bridgeClientTools(tools: ClientToolSpec[] | undefined): ClientToolSpec[] {
+function bridgeClientTools(
+  tools: ClientToolSpec[] | undefined,
+): ClientToolSpec[] {
   return (tools ?? []).flatMap((tool) => {
     const name = typeof tool.name === "string" ? tool.name.trim() : "";
     if (!name) return [];
-    return [{
-      name,
-      ...(typeof tool.description === "string" && tool.description ? { description: tool.description } : {}),
-      ...(tool.parameters !== undefined ? { parameters: tool.parameters } : {})
-    }];
+    return [
+      {
+        name,
+        ...(typeof tool.description === "string" && tool.description
+          ? { description: tool.description }
+          : {}),
+        ...(tool.parameters !== undefined
+          ? { parameters: tool.parameters }
+          : {}),
+      },
+    ];
   });
 }
 
 function cursorLocalSdkBridgeHeaders(env: Env): Headers {
   const headers = new Headers({
-    "Content-Type": "application/json"
+    "Content-Type": "application/json",
   });
   if (env.CURSOR_SDK_BRIDGE_TOKEN?.trim()) {
-    headers.set("Authorization", `Bearer ${env.CURSOR_SDK_BRIDGE_TOKEN.trim()}`);
+    headers.set(
+      "Authorization",
+      `Bearer ${env.CURSOR_SDK_BRIDGE_TOKEN.trim()}`,
+    );
   }
   return headers;
 }
 
-async function writeSdkUpload(writer: WritableStreamDefaultWriter<Uint8Array>, frame: Uint8Array): Promise<void> {
+async function writeSdkUpload(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+  frame: Uint8Array,
+): Promise<void> {
   await writer.write(frame).catch((error) => {
     throw error instanceof Error ? error : new Error(String(error));
   });
 }
 
-async function closeSdkUpload(writer: WritableStreamDefaultWriter<Uint8Array>): Promise<void> {
+async function closeSdkUpload(
+  writer: WritableStreamDefaultWriter<Uint8Array>,
+): Promise<void> {
   await writer.close().catch(() => undefined);
   writer.releaseLock();
 }
@@ -769,7 +1261,13 @@ async function closeSdkUpload(writer: WritableStreamDefaultWriter<Uint8Array>): 
 function withSdkStartTimeout<T>(promise: Promise<T>): Promise<T> {
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => {
-      reject(new HttpError("Cursor local SDK stream did not start.", 504, "cursor_sdk_stream_timeout"));
+      reject(
+        new HttpError(
+          "Cursor local SDK stream did not start.",
+          504,
+          "cursor_sdk_stream_timeout",
+        ),
+      );
     }, SDK_STREAM_START_TIMEOUT_MS);
     promise.then(
       (value) => {
@@ -779,29 +1277,41 @@ function withSdkStartTimeout<T>(promise: Promise<T>): Promise<T> {
       (error) => {
         clearTimeout(timer);
         reject(error);
-      }
+      },
     );
   });
 }
 
 function cursorLocalSdkEndpoint(env: Env): string {
   const endpoint = env.CURSOR_LOCAL_AGENT_ENDPOINT?.trim();
-  if (!endpoint) throw new HttpError("Cursor local SDK endpoint is not configured", 500, "cursor_missing_endpoint");
+  if (!endpoint)
+    throw new HttpError(
+      "Cursor local SDK endpoint is not configured",
+      500,
+      "cursor_missing_endpoint",
+    );
   return endpoint;
 }
 
-function encodeAgentClientRunRequest(input: { agentId: string; messageId: string; modelId: string; prompt: string }): Uint8Array {
+function encodeAgentClientRunRequest(input: {
+  agentId: string;
+  messageId: string;
+  modelId: string;
+  prompt: string;
+}): Uint8Array {
   const userMessage = protoMessage([
     protoStringField(1, input.prompt),
     protoStringField(2, input.messageId),
-    protoVarintField(4, AGENT_MODE_AGENT)
+    protoVarintField(4, AGENT_MODE_AGENT),
   ]);
   const userMessageAction = protoMessage([protoMessageField(1, userMessage)]);
-  const conversationAction = protoMessage([protoMessageField(1, userMessageAction)]);
+  const conversationAction = protoMessage([
+    protoMessageField(1, userMessageAction),
+  ]);
   const modelDetails = protoMessage([
     protoStringField(1, input.modelId),
     protoStringField(3, input.modelId),
-    protoStringField(4, input.modelId)
+    protoStringField(4, input.modelId),
   ]);
   const requestedModel = protoMessage([protoStringField(1, input.modelId)]);
   const runRequest = protoMessage([
@@ -812,21 +1322,24 @@ function encodeAgentClientRunRequest(input: { agentId: string; messageId: string
     protoStringField(5, input.agentId),
     protoStringField(13, "sdk"),
     protoMessageField(9, requestedModel),
-    protoVarintField(19, 1)
+    protoVarintField(19, 1),
   ]);
   return protoMessage([protoMessageField(1, runRequest)]);
 }
 
-function encodeAgentClientRequestContextResult(input: { id: number; execId?: string }, options: { workingDirectory?: string } = {}): Uint8Array {
+function encodeAgentClientRequestContextResult(
+  input: { id: number; execId?: string },
+  options: { workingDirectory?: string } = {},
+): Uint8Array {
   const workingDirectory = sdkWorkingDirectory(options.workingDirectory);
   const env = protoMessage([
-    protoStringField(1, "Cloudflare Worker"),
+    protoStringField(1, "Cursor API Gateway"),
     protoStringField(2, workingDirectory),
     protoStringField(3, "sh"),
     protoVarintField(5, false),
     protoStringField(10, "UTC"),
     protoStringField(11, workingDirectory),
-    protoStringField(21, workingDirectory)
+    protoStringField(21, workingDirectory),
   ]);
   const requestContext = protoMessage([
     protoMessageField(4, env),
@@ -842,25 +1355,32 @@ function encodeAgentClientRequestContextResult(input: { id: number; execId?: str
     protoVarintField(42, true),
     protoVarintField(43, true),
     protoVarintField(44, true),
-    protoVarintField(45, true)
+    protoVarintField(45, true),
   ]);
   const success = protoMessage([protoMessageField(1, requestContext)]);
   const result = protoMessage([protoMessageField(1, success)]);
   const execClientMessage = protoMessage([
     protoVarintField(1, input.id),
     protoStringField(15, input.execId),
-    protoMessageField(10, result)
+    protoMessageField(10, result),
   ]);
   return protoMessage([protoMessageField(2, execClientMessage)]);
 }
 
 function sdkWorkingDirectory(value: string | undefined): string {
   const trimmed = value?.trim();
-  if (!trimmed || trimmed.toLowerCase() === "undefined" || trimmed.toLowerCase() === "null") return ".";
+  if (
+    !trimmed ||
+    trimmed.toLowerCase() === "undefined" ||
+    trimmed.toLowerCase() === "null"
+  )
+    return ".";
   return trimmed;
 }
 
-function decodeLocalAgentServerFrame(payload: Uint8Array): LocalSdkDecodedEvent[] {
+function decodeLocalAgentServerFrame(
+  payload: Uint8Array,
+): LocalSdkDecodedEvent[] {
   const output: LocalSdkDecodedEvent[] = [];
   try {
     for (const field of decodeProtobufFields(payload)) {
@@ -872,19 +1392,26 @@ function decodeLocalAgentServerFrame(payload: Uint8Array): LocalSdkDecodedEvent[
       }
     }
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Could not decode Cursor local SDK stream";
+    const message =
+      error instanceof Error
+        ? error.message
+        : "Could not decode Cursor local SDK stream";
     throw new HttpError(message, 502, "cursor_stream_error");
   }
   return output.length ? output : [{ type: "ignore" }];
 }
 
-function decodeExecServerMessage(payload: Uint8Array): LocalSdkDecodedEvent | null {
+function decodeExecServerMessage(
+  payload: Uint8Array,
+): LocalSdkDecodedEvent | null {
   const fields = decodeProtobufFields(payload);
-  if (fields.some((field) => field.no === 10 && field.value instanceof Uint8Array)) {
+  if (
+    fields.some((field) => field.no === 10 && field.value instanceof Uint8Array)
+  ) {
     return {
       type: "request_context",
       id: numberField(fields, 1) || 0,
-      execId: stringField(fields, 15)
+      execId: stringField(fields, 15),
     };
   }
   return decodeExecServerToolCall(payload, fields);
@@ -907,17 +1434,26 @@ function decodeInteractionUpdate(payload: Uint8Array): LocalSdkDecodedEvent[] {
   return output;
 }
 
-function decodeToolCallUpdate(payload: Uint8Array, completed: boolean): LocalSdkDecodedEvent | null {
+function decodeToolCallUpdate(
+  payload: Uint8Array,
+  completed: boolean,
+): LocalSdkDecodedEvent | null {
   const fields = decodeProtobufFields(payload);
   const callId = stringField(fields, 1) || stableToolCallId(payload);
   const toolCallBytes = bytesField(fields, 2);
   if (!toolCallBytes) return null;
   const decoded = decodeSdkToolCall(toolCallBytes);
   if (!decoded || (completed && decoded.hasResult)) return null;
-  return { type: "tool_call", id: callId, toolCall: normalizeSdkToolCallForOpenCode(decoded.toolCall) };
+  return {
+    type: "tool_call",
+    id: callId,
+    toolCall: normalizeSdkToolCallForOpenCode(decoded.toolCall),
+  };
 }
 
-function decodeSdkToolCall(payload: Uint8Array): { toolCall: CursorToolCall; hasResult: boolean } | null {
+function decodeSdkToolCall(
+  payload: Uint8Array,
+): { toolCall: CursorToolCall; hasResult: boolean } | null {
   for (const field of decodeProtobufFields(payload)) {
     if (!(field.value instanceof Uint8Array)) continue;
     const spec = TOOL_CALL_SPECS[field.no];
@@ -929,14 +1465,17 @@ function decodeSdkToolCall(payload: Uint8Array): { toolCall: CursorToolCall; has
       hasResult,
       toolCall: {
         name: spec.name,
-        arguments: args ? decodeToolArgs(spec.argsKind, args) : {}
-      }
+        arguments: args ? decodeToolArgs(spec.argsKind, args) : {},
+      },
     };
   }
   return null;
 }
 
-function decodeExecServerToolCall(payload: Uint8Array, fields = decodeProtobufFields(payload)): LocalSdkDecodedEvent | null {
+function decodeExecServerToolCall(
+  payload: Uint8Array,
+  fields = decodeProtobufFields(payload),
+): LocalSdkDecodedEvent | null {
   const id = numberField(fields, 1);
   const execId = stringField(fields, 15);
   for (const field of fields) {
@@ -944,32 +1483,47 @@ function decodeExecServerToolCall(payload: Uint8Array, fields = decodeProtobufFi
     const spec = EXEC_TOOL_SPECS[field.no];
     if (!spec) continue;
     const args = decodeToolArgs(spec.argsKind, field.value);
-    const toolCallId = stringArg(args, "toolCallId") || execId || `exec_${id ?? stableToolCallId(payload)}`;
+    const toolCallId =
+      stringArg(args, "toolCallId") ||
+      execId ||
+      `exec_${id ?? stableToolCallId(payload)}`;
     delete args.toolCallId;
     return {
       type: "tool_call",
       id: toolCallId,
-      toolCall: normalizeSdkToolCallForOpenCode({ name: spec.name, arguments: args })
+      toolCall: normalizeSdkToolCallForOpenCode({
+        name: spec.name,
+        arguments: args,
+      }),
     };
   }
   return null;
 }
 
-function normalizeSdkToolCallForOpenCode(toolCall: CursorToolCall): CursorToolCall {
+function normalizeSdkToolCallForOpenCode(
+  toolCall: CursorToolCall,
+): CursorToolCall {
   if (toolCall.name.toLowerCase() !== "edit") return toolCall;
   const path = stringArg(toolCall.arguments, "path");
-  const streamContent = stringArgAllowEmpty(toolCall.arguments, "streamContent", "stream_content");
+  const streamContent = stringArgAllowEmpty(
+    toolCall.arguments,
+    "streamContent",
+    "stream_content",
+  );
   if (!path || streamContent === undefined) return toolCall;
   return {
     name: "write",
     arguments: {
       path,
-      fileText: streamContent
-    }
+      fileText: streamContent,
+    },
   };
 }
 
-function decodeToolArgs(kind: ArgsKind, payload: Uint8Array): Record<string, unknown> {
+function decodeToolArgs(
+  kind: ArgsKind,
+  payload: Uint8Array,
+): Record<string, unknown> {
   const fields = decodeProtobufFields(payload);
   switch (kind) {
     case "shell":
@@ -977,19 +1531,25 @@ function decodeToolArgs(kind: ArgsKind, payload: Uint8Array): Record<string, unk
         command: stringField(fields, 1),
         workingDirectory: stringField(fields, 2),
         timeout: numberField(fields, 3),
-        toolCallId: stringField(fields, 4)
+        toolCallId: stringField(fields, 4),
       });
     case "write":
       return compactRecord({
         path: stringField(fields, 1),
         fileText: stringField(fields, 2),
         toolCallId: stringField(fields, 3),
-        returnFileContentAfterWrite: booleanField(fields, 4)
+        returnFileContentAfterWrite: booleanField(fields, 4),
       });
     case "delete":
-      return compactRecord({ path: stringField(fields, 1), toolCallId: stringField(fields, 2) });
+      return compactRecord({
+        path: stringField(fields, 1),
+        toolCallId: stringField(fields, 2),
+      });
     case "glob":
-      return compactRecord({ targetDirectory: stringField(fields, 1), globPattern: stringField(fields, 2) });
+      return compactRecord({
+        targetDirectory: stringField(fields, 1),
+        globPattern: stringField(fields, 2),
+      });
     case "grep":
       return compactRecord({
         pattern: stringField(fields, 1),
@@ -1006,26 +1566,33 @@ function decodeToolArgs(kind: ArgsKind, payload: Uint8Array): Record<string, unk
         sort: stringField(fields, 12),
         sortAscending: booleanField(fields, 13),
         toolCallId: stringField(fields, 14),
-        offset: numberField(fields, 16)
+        offset: numberField(fields, 16),
       });
     case "readTool":
       return compactRecord({
         path: stringField(fields, 1),
         offset: numberField(fields, 2),
         limit: numberField(fields, 3),
-        includeLineNumbers: booleanField(fields, 5)
+        includeLineNumbers: booleanField(fields, 5),
       });
     case "readExec":
       return compactRecord({
         path: stringField(fields, 1),
         toolCallId: stringField(fields, 2),
         offset: numberField(fields, 4),
-        limit: numberField(fields, 5)
+        limit: numberField(fields, 5),
       });
     case "edit":
-      return compactRecord({ path: stringField(fields, 1), streamContent: stringField(fields, 6) });
+      return compactRecord({
+        path: stringField(fields, 1),
+        streamContent: stringField(fields, 6),
+      });
     case "ls":
-      return compactRecord({ path: stringField(fields, 1), ignore: stringFields(fields, 2), toolCallId: stringField(fields, 3) });
+      return compactRecord({
+        path: stringField(fields, 1),
+        ignore: stringFields(fields, 2),
+        toolCallId: stringField(fields, 3),
+      });
     case "readLints":
       return compactRecord({ paths: stringFields(fields, 1) });
     case "mcp":
@@ -1034,13 +1601,13 @@ function decodeToolArgs(kind: ArgsKind, payload: Uint8Array): Record<string, unk
         args: protoValueMap(fields, 2),
         toolCallId: stringField(fields, 3),
         providerIdentifier: stringField(fields, 4),
-        toolName: stringField(fields, 5)
+        toolName: stringField(fields, 5),
       });
     case "semSearch":
       return compactRecord({
         query: stringField(fields, 1),
         targetDirectories: stringFields(fields, 2),
-        explanation: stringField(fields, 3)
+        explanation: stringField(fields, 3),
       });
   }
 }
@@ -1050,27 +1617,99 @@ function isEmittableSdkToolCall(toolCall: CursorToolCall): boolean {
   const args = toolCall.arguments ?? {};
   if (name === "glob") return hasGlobRequest(args);
   if (name === "ls") return true;
-  if (name === "shell") return hasAnyStringArg(args, "command", "cmd", "script");
+  if (name === "shell")
+    return hasAnyStringArg(args, "command", "cmd", "script");
   if (name === "write") {
-    return hasAnyStringArg(args, "path", "filePath", "file_path", "targetFile", "target_file") &&
-      hasAnyStringArgAllowEmpty(args, "fileText", "file_text", "content", "contents", "text", "fileContent", "file_content", "streamContent", "stream_content");
+    return (
+      hasAnyStringArg(
+        args,
+        "path",
+        "filePath",
+        "file_path",
+        "targetFile",
+        "target_file",
+      ) &&
+      hasAnyStringArgAllowEmpty(
+        args,
+        "fileText",
+        "file_text",
+        "content",
+        "contents",
+        "text",
+        "fileContent",
+        "file_content",
+        "streamContent",
+        "stream_content",
+      )
+    );
   }
   if (name === "edit") {
     const hasCompleteReplacement =
-      hasAnyStringArgAllowEmpty(args, "oldText", "old_text", "oldString", "old_string", "old_str", "old", "search", "searchString", "search_string") &&
-      hasAnyStringArgAllowEmpty(args, "newText", "new_text", "newString", "new_string", "new_str", "replacement", "replace", "content");
+      hasAnyStringArgAllowEmpty(
+        args,
+        "oldText",
+        "old_text",
+        "oldString",
+        "old_string",
+        "old_str",
+        "old",
+        "search",
+        "searchString",
+        "search_string",
+      ) &&
+      hasAnyStringArgAllowEmpty(
+        args,
+        "newText",
+        "new_text",
+        "newString",
+        "new_string",
+        "new_str",
+        "replacement",
+        "replace",
+        "content",
+      );
     return (
-      hasAnyStringArg(args, "path", "filePath", "file_path", "targetFile", "target_file") &&
-      (hasAnyStringArgAllowEmpty(args, "patchContent", "patch_content", "patch", "diff", "unifiedDiff", "unified_diff") ||
+      hasAnyStringArg(
+        args,
+        "path",
+        "filePath",
+        "file_path",
+        "targetFile",
+        "target_file",
+      ) &&
+      (hasAnyStringArgAllowEmpty(
+        args,
+        "patchContent",
+        "patch_content",
+        "patch",
+        "diff",
+        "unifiedDiff",
+        "unified_diff",
+      ) ||
         hasAnyStringArgAllowEmpty(args, "streamContent", "stream_content") ||
         hasCompleteReplacement)
     );
   }
-  if (name === "read" || name === "delete") return hasAnyStringArg(args, "path", "filePath", "file_path", "targetFile", "target_file");
-  if (name === "grep") return hasAnyStringArg(args, "pattern", "query", "regex", "search");
-  if (name === "semSearch") return hasAnyStringArg(args, "query", "pattern", "search");
-  if (name === "readLints") return Array.isArray(args.paths) && args.paths.some((item) => typeof item === "string" && item.trim());
-  if (name === "mcp") return hasAnyStringArg(args, "toolName", "tool_name", "name");
+  if (name === "read" || name === "delete")
+    return hasAnyStringArg(
+      args,
+      "path",
+      "filePath",
+      "file_path",
+      "targetFile",
+      "target_file",
+    );
+  if (name === "grep")
+    return hasAnyStringArg(args, "pattern", "query", "regex", "search");
+  if (name === "semSearch")
+    return hasAnyStringArg(args, "query", "pattern", "search");
+  if (name === "readLints")
+    return (
+      Array.isArray(args.paths) &&
+      args.paths.some((item) => typeof item === "string" && item.trim())
+    );
+  if (name === "mcp")
+    return hasAnyStringArg(args, "toolName", "tool_name", "name");
   return Object.keys(args).length > 0;
 }
 
@@ -1078,23 +1717,50 @@ function hasStringArg(args: Record<string, unknown>, key: string): boolean {
   return typeof args[key] === "string" && args[key].trim().length > 0;
 }
 
-function hasAnyStringArg(args: Record<string, unknown>, ...keys: string[]): boolean {
+function hasAnyStringArg(
+  args: Record<string, unknown>,
+  ...keys: string[]
+): boolean {
   return keys.some((key) => hasStringArg(args, key));
 }
 
-function hasAnyStringArgAllowEmpty(args: Record<string, unknown>, ...keys: string[]): boolean {
+function hasAnyStringArgAllowEmpty(
+  args: Record<string, unknown>,
+  ...keys: string[]
+): boolean {
   return keys.some((key) => typeof args[key] === "string");
 }
 
 function hasGlobRequest(args: Record<string, unknown>): boolean {
-  if (hasAnyStringArg(args, "globPattern", "glob_pattern", "filePattern", "file_pattern", "pattern", "glob", "query", "include", "includeGlob", "include_glob")) {
+  if (
+    hasAnyStringArg(
+      args,
+      "globPattern",
+      "glob_pattern",
+      "filePattern",
+      "file_pattern",
+      "pattern",
+      "glob",
+      "query",
+      "include",
+      "includeGlob",
+      "include_glob",
+    )
+  ) {
     return true;
   }
-  const target = stringArg(args, "targetDirectory") || stringArg(args, "target_directory") || stringArg(args, "targeting") || stringArg(args, "path");
+  const target =
+    stringArg(args, "targetDirectory") ||
+    stringArg(args, "target_directory") ||
+    stringArg(args, "targeting") ||
+    stringArg(args, "path");
   return typeof target === "string" && /[*?[\]{}]/.test(target);
 }
 
-function stringArgAllowEmpty(args: Record<string, unknown>, ...keys: string[]): string | undefined {
+function stringArgAllowEmpty(
+  args: Record<string, unknown>,
+  ...keys: string[]
+): string | undefined {
   for (const key of keys) {
     const value = args[key];
     if (typeof value === "string") return value;
@@ -1107,14 +1773,17 @@ function sdkPrompt(prompt: { text: string; images?: CursorImage[] }): string {
   return `${prompt.text}\n\n[${prompt.images.length} image input${prompt.images.length === 1 ? "" : "s"} attached by the OpenAI-compatible client.]`;
 }
 
-function parseCursorSdkError(text: string): { message?: string; code?: string } {
+function parseCursorSdkError(text: string): {
+  message?: string;
+  code?: string;
+} {
   try {
     const payload = JSON.parse(text) as unknown;
     if (isRecord(payload)) {
       const error = isRecord(payload.error) ? payload.error : payload;
       return {
         message: typeof error.message === "string" ? error.message : undefined,
-        code: typeof error.code === "string" ? error.code : undefined
+        code: typeof error.code === "string" ? error.code : undefined,
       };
     }
   } catch {
@@ -1126,21 +1795,17 @@ function parseCursorSdkError(text: string): { message?: string; code?: string } 
 async function sdkSessionIdentity(
   apiKey: string,
   sessionKey: string,
-  sessionOwnerKey?: string
+  sessionOwnerKey?: string,
 ): Promise<{ id: string; ownerHash: string; sessionHash: string }> {
-  const ownerHash = await sha256Hex(sessionOwnerKey || `cursor-key:${await sha256Hex(apiKey)}`);
+  const ownerHash = await sha256Hex(
+    sessionOwnerKey || `cursor-key:${await sha256Hex(apiKey)}`,
+  );
   const sessionHash = await sha256Hex(sessionKey);
   return {
     id: await sha256Hex(`${ownerHash}\n${sessionHash}`),
     ownerHash,
-    sessionHash
+    sessionHash,
   };
-}
-
-function pruneSessions(now: number) {
-  for (const [key, session] of sdkSessions) {
-    if (session.updatedAt + SDK_SESSION_TTL_MS < now) sdkSessions.delete(key);
-  }
 }
 
 function newLocalSdkAgentId(uuid: string): string {
@@ -1149,55 +1814,6 @@ function newLocalSdkAgentId(uuid: string): string {
 
 function newLocalSdkRunId(uuid: string): string {
   return uuid.startsWith("run-") ? uuid : `run-${uuid}`;
-}
-
-async function readPersistedSdkSession(env: Env, id: string, now: number): Promise<CursorSdkSession | undefined> {
-  try {
-    const row = await env.DB.prepare(`SELECT agent_id, updated_at FROM sdk_sessions WHERE id = ? LIMIT 1`)
-      .bind(id)
-      .first<{ agent_id: string; updated_at: string }>();
-    if (!row?.agent_id) return undefined;
-    const updatedAt = Date.parse(row.updated_at);
-    if (!Number.isFinite(updatedAt) || updatedAt + SDK_SESSION_TTL_MS < now) {
-      await deletePersistedSdkSession(env, id);
-      return undefined;
-    }
-    const session = { agentId: row.agent_id, updatedAt };
-    sdkSessions.set(id, session);
-    return session;
-  } catch {
-    return undefined;
-  }
-}
-
-async function savePersistedSdkSession(
-  env: Env,
-  identity: { id: string; ownerHash: string; sessionHash: string },
-  agentId: string,
-  updatedAt: Date
-): Promise<void> {
-  try {
-    const timestamp = updatedAt.toISOString();
-    await env.DB.prepare(
-      `INSERT INTO sdk_sessions (id, owner_hash, session_hash, agent_id, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?)
-       ON CONFLICT(id) DO UPDATE SET
-         agent_id = excluded.agent_id,
-         updated_at = excluded.updated_at`
-    )
-      .bind(identity.id, identity.ownerHash, identity.sessionHash, agentId, timestamp, timestamp)
-      .run();
-  } catch {
-    // D1 persistence is best-effort so local development without migrations still works.
-  }
-}
-
-async function deletePersistedSdkSession(env: Env, id: string): Promise<void> {
-  try {
-    await env.DB.prepare(`DELETE FROM sdk_sessions WHERE id = ?`).bind(id).run();
-  } catch {
-    // Ignore missing table or transient persistence failures.
-  }
 }
 
 function protoMessage(parts: Uint8Array[]): Uint8Array {
@@ -1215,18 +1831,37 @@ function protoMessageField(fieldNumber: number, value: Uint8Array): Uint8Array {
   return protoLengthDelimitedField(fieldNumber, value);
 }
 
-function protoStringField(fieldNumber: number, value: string | undefined): Uint8Array {
+function protoStringField(
+  fieldNumber: number,
+  value: string | undefined,
+): Uint8Array {
   if (value === undefined) return new Uint8Array(0);
-  return protoLengthDelimitedField(fieldNumber, new TextEncoder().encode(value));
+  return protoLengthDelimitedField(
+    fieldNumber,
+    new TextEncoder().encode(value),
+  );
 }
 
-function protoLengthDelimitedField(fieldNumber: number, value: Uint8Array): Uint8Array {
-  return protoMessage([varint((fieldNumber << 3) | 2), varint(value.length), value]);
+function protoLengthDelimitedField(
+  fieldNumber: number,
+  value: Uint8Array,
+): Uint8Array {
+  return protoMessage([
+    varint((fieldNumber << 3) | 2),
+    varint(value.length),
+    value,
+  ]);
 }
 
-function protoVarintField(fieldNumber: number, value: number | boolean | undefined): Uint8Array {
+function protoVarintField(
+  fieldNumber: number,
+  value: number | boolean | undefined,
+): Uint8Array {
   if (value === undefined) return new Uint8Array(0);
-  return protoMessage([varint(fieldNumber << 3), varint(value === true ? 1 : value === false ? 0 : value)]);
+  return protoMessage([
+    varint(fieldNumber << 3),
+    varint(value === true ? 1 : value === false ? 0 : value),
+  ]);
 }
 
 function varint(value: number): Uint8Array {
@@ -1248,7 +1883,9 @@ function encodeConnectFrame(payload: Uint8Array): Uint8Array {
   return frame;
 }
 
-async function* parseConnectProtoFrames(stream: ReadableStream<Uint8Array> | null): AsyncGenerator<Uint8Array> {
+async function* parseConnectProtoFrames(
+  stream: ReadableStream<Uint8Array> | null,
+): AsyncGenerator<Uint8Array> {
   if (!stream) return;
   const reader = stream.getReader();
   let buffer = new Uint8Array(0);
@@ -1260,12 +1897,20 @@ async function* parseConnectProtoFrames(stream: ReadableStream<Uint8Array> | nul
       for (;;) {
         if (buffer.length < 5) break;
         const flags = buffer[0];
-        const length = new DataView(buffer.buffer, buffer.byteOffset + 1, 4).getUint32(0, false);
+        const length = new DataView(
+          buffer.buffer,
+          buffer.byteOffset + 1,
+          4,
+        ).getUint32(0, false);
         if (buffer.length < 5 + length) break;
         const payload = buffer.slice(5, 5 + length);
         buffer = buffer.slice(5 + length);
         if ((flags & 1) === 1) {
-          throw new HttpError("Cursor returned a compressed SDK frame that this Worker cannot decode.", 502, "cursor_stream_error");
+          throw new HttpError(
+            "Cursor returned a compressed SDK frame that this Worker cannot decode.",
+            502,
+            "cursor_stream_error",
+          );
         }
         if ((flags & 2) === 2) {
           handleEndStreamFrame(payload);
@@ -1287,7 +1932,10 @@ function handleEndStreamFrame(payload: Uint8Array) {
   try {
     const parsed = JSON.parse(text) as unknown;
     if (isRecord(parsed) && isRecord(parsed.error)) {
-      const message = typeof parsed.error.message === "string" ? parsed.error.message : "Cursor local SDK stream failed";
+      const message =
+        typeof parsed.error.message === "string"
+          ? parsed.error.message
+          : "Cursor local SDK stream failed";
       throw new HttpError(message, 502, "cursor_stream_error");
     }
   } catch (error) {
@@ -1311,20 +1959,32 @@ function decodeProtobufFields(bytes: Uint8Array): ProtobufField[] {
       const end = offset + 8;
       if (end > bytes.length) break;
       const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 8);
-      fields.push({ no: fieldNumber, wt: wireType, value: view.getFloat64(0, true) });
+      fields.push({
+        no: fieldNumber,
+        wt: wireType,
+        value: view.getFloat64(0, true),
+      });
       offset = end;
     } else if (wireType === 2) {
       const length = readVarint(bytes, offset);
       offset = length.offset;
       const end = offset + length.value;
       if (end > bytes.length) break;
-      fields.push({ no: fieldNumber, wt: wireType, value: bytes.slice(offset, end) });
+      fields.push({
+        no: fieldNumber,
+        wt: wireType,
+        value: bytes.slice(offset, end),
+      });
       offset = end;
     } else if (wireType === 5) {
       const end = offset + 4;
       if (end > bytes.length) break;
       const view = new DataView(bytes.buffer, bytes.byteOffset + offset, 4);
-      fields.push({ no: fieldNumber, wt: wireType, value: view.getUint32(0, true) });
+      fields.push({
+        no: fieldNumber,
+        wt: wireType,
+        value: view.getUint32(0, true),
+      });
       offset = end;
     } else {
       break;
@@ -1333,7 +1993,10 @@ function decodeProtobufFields(bytes: Uint8Array): ProtobufField[] {
   return fields;
 }
 
-function readVarint(bytes: Uint8Array, offset: number): { value: number; offset: number } {
+function readVarint(
+  bytes: Uint8Array,
+  offset: number,
+): { value: number; offset: number } {
   let value = 0;
   let shift = 0;
   let cursor = offset;
@@ -1346,37 +2009,62 @@ function readVarint(bytes: Uint8Array, offset: number): { value: number; offset:
   return { value, offset: cursor };
 }
 
-function bytesField(fields: ProtobufField[], fieldNumber: number): Uint8Array | undefined {
-  const field = fields.find((item) => item.no === fieldNumber && item.value instanceof Uint8Array);
+function bytesField(
+  fields: ProtobufField[],
+  fieldNumber: number,
+): Uint8Array | undefined {
+  const field = fields.find(
+    (item) => item.no === fieldNumber && item.value instanceof Uint8Array,
+  );
   return field?.value instanceof Uint8Array ? field.value : undefined;
 }
 
-function stringField(fields: ProtobufField[], fieldNumber: number): string | undefined {
+function stringField(
+  fields: ProtobufField[],
+  fieldNumber: number,
+): string | undefined {
   const bytes = bytesField(fields, fieldNumber);
   return bytes ? decodeUtf8(bytes) : undefined;
 }
 
-function stringFields(fields: ProtobufField[], fieldNumber: number): string[] | undefined {
+function stringFields(
+  fields: ProtobufField[],
+  fieldNumber: number,
+): string[] | undefined {
   const values = fields
-    .filter((item) => item.no === fieldNumber && item.value instanceof Uint8Array)
+    .filter(
+      (item) => item.no === fieldNumber && item.value instanceof Uint8Array,
+    )
     .map((item) => decodeUtf8(item.value as Uint8Array));
   return values.length ? values : undefined;
 }
 
-function numberField(fields: ProtobufField[], fieldNumber: number): number | undefined {
-  const field = fields.find((item) => item.no === fieldNumber && typeof item.value === "number");
+function numberField(
+  fields: ProtobufField[],
+  fieldNumber: number,
+): number | undefined {
+  const field = fields.find(
+    (item) => item.no === fieldNumber && typeof item.value === "number",
+  );
   return typeof field?.value === "number" ? field.value : undefined;
 }
 
-function booleanField(fields: ProtobufField[], fieldNumber: number): boolean | undefined {
+function booleanField(
+  fields: ProtobufField[],
+  fieldNumber: number,
+): boolean | undefined {
   const value = numberField(fields, fieldNumber);
   return value === undefined ? undefined : value !== 0;
 }
 
-function protoValueMap(fields: ProtobufField[], fieldNumber: number): Record<string, unknown> | undefined {
+function protoValueMap(
+  fields: ProtobufField[],
+  fieldNumber: number,
+): Record<string, unknown> | undefined {
   const output: Record<string, unknown> = {};
   for (const field of fields) {
-    if (field.no !== fieldNumber || !(field.value instanceof Uint8Array)) continue;
+    if (field.no !== fieldNumber || !(field.value instanceof Uint8Array))
+      continue;
     const entryFields = decodeProtobufFields(field.value);
     const key = stringField(entryFields, 1);
     const valueBytes = bytesField(entryFields, 2);
@@ -1416,14 +2104,22 @@ function protoList(bytes: Uint8Array): unknown[] {
   return output;
 }
 
-function stringArg(args: Record<string, unknown>, key: string): string | undefined {
+function stringArg(
+  args: Record<string, unknown>,
+  key: string,
+): string | undefined {
   const value = args[key];
   return typeof value === "string" && value ? value : undefined;
 }
 
-function compactRecord(input: Record<string, unknown>): Record<string, unknown> {
+function compactRecord(
+  input: Record<string, unknown>,
+): Record<string, unknown> {
   return Object.fromEntries(
-    Object.entries(input).filter(([, value]) => value !== undefined && (!Array.isArray(value) || value.length > 0))
+    Object.entries(input).filter(
+      ([, value]) =>
+        value !== undefined && (!Array.isArray(value) || value.length > 0),
+    ),
   );
 }
 
@@ -1433,7 +2129,10 @@ function stableToolCallId(value: Uint8Array): string {
   return `tool_${hash.toString(16)}`;
 }
 
-function concatBytes(a: Uint8Array<ArrayBufferLike>, b: Uint8Array<ArrayBufferLike>): Uint8Array<ArrayBuffer> {
+function concatBytes(
+  a: Uint8Array<ArrayBufferLike>,
+  b: Uint8Array<ArrayBufferLike>,
+): Uint8Array<ArrayBuffer> {
   const out = new Uint8Array(a.length + b.length) as Uint8Array<ArrayBuffer>;
   out.set(a, 0);
   out.set(b, a.length);

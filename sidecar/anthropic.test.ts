@@ -1,4 +1,4 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import {
   anthropicError,
   anthropicMessage,
@@ -11,7 +11,7 @@ import {
   mapToolChoice,
   toolCallsForSessionFingerprint
 } from "./anthropic";
-import type { CursorTextEvent } from "../worker/cursor";
+import type { CursorTextEvent } from "../core/cursor";
 
 describe("mapModel", () => {
   test("preserves live Cursor catalog ids and parameterized model syntax", () => {

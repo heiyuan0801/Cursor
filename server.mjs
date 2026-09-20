@@ -281,6 +281,9 @@ function spawnLogged(name, command, args, env, logPaths, detached) {
 }
 
 async function cmdStart(flags) {
+  if (!(process.env.DATABASE_URL || process.env.POSTGRES_URL || process.env.PGHOST) || !process.env.REDIS_URL) {
+    throw new Error("PostgreSQL (DATABASE_URL or PGHOST) and REDIS_URL are required. See docs/POSTGRES_REDIS_MIGRATION.md.");
+  }
   assertDependencies();
   ensureClientAssets();
   const localConfig = ensureLocalConfig();
@@ -336,10 +339,8 @@ async function cmdStart(flags) {
     PORT: String(port),
     CURSOR_SDK_BRIDGE_URL: `http://${host}:${bridgePort}/sdk`,
     CURSOR_SDK_BRIDGE_TOKEN: bridgeToken,
-    CURSOR_ROUTER_STATE_PATH: path.join(RUNTIME_DIR, "router-state.json"),
     ENCRYPTION_KEY: process.env.ENCRYPTION_KEY || localConfig.encryptionKey,
     ADMIN_PASSWORD: process.env.ADMIN_PASSWORD || "",
-    LOCAL_AUTH_STATE_PATH: path.join(RUNTIME_DIR, "auth-state.json"),
     PUBLIC_BASE_URL: process.env.PUBLIC_BASE_URL || "",
     STATIC_DIR: path.join(repoRoot, "dist", "client")
   };

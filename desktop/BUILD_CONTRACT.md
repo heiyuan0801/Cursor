@@ -1,3 +1,5 @@
+> Historical build contract: Worker/D1 references and in-memory session fallback below are obsolete. Current shared modules live in core/; the gateway requires PostgreSQL + Redis. Use ../docs/POSTGRES_REDIS_MIGRATION.md for current deployment requirements.
+
 # Windows Port — Build Contract (ground truth from the macOS app)
 
 This is the SINGLE SOURCE OF TRUTH for the `desktop/` Tauri 2 port. Every value here was

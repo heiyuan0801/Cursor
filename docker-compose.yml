@@ -1,6 +1,33 @@
 name: cursor2api
 
 services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-cursor2api}
+      POSTGRES_USER: ${POSTGRES_USER:-cursor2api}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD before starting Compose}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    restart: unless-stopped
+
   bridge:
     image: ${CURSOR2API_BRIDGE_IMAGE:-docker.io/${CURSOR2API_IMAGE_NAMESPACE:-nglsg}/cursor2api-bridge:${CURSOR2API_IMAGE_TAG:-latest}}
     build:
@@ -29,6 +56,10 @@ services:
     depends_on:
       bridge:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
     environment:
       HOST: 0.0.0.0
       PORT: 6718
@@ -40,11 +71,18 @@ services:
       CURSOR_SDK_BRIDGE_URL: http://bridge:8792/sdk
       CURSOR_SDK_BRIDGE_TOKEN: ${CURSOR_SDK_BRIDGE_TOKEN:?Set CURSOR_SDK_BRIDGE_TOKEN before starting Compose}
       CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS: ${CURSOR_SDK_BRIDGE_RUN_TIMEOUT_MS:-180000}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGDATABASE: ${POSTGRES_DB:-cursor2api}
+      PGUSER: ${POSTGRES_USER:-cursor2api}
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      REDIS_PREFIX: ${REDIS_PREFIX:-cursor2api:}
+      CURSOR_ACCOUNT_STICKY_TTL_SECONDS: ${CURSOR_ACCOUNT_STICKY_TTL_SECONDS:-7200}
       ENCRYPTION_KEY: ${ENCRYPTION_KEY:?Set ENCRYPTION_KEY before starting Compose}
-      CURSOR_ROUTER_STATE_PATH: /var/lib/api-for-cursor/router-state.json
-      LOCAL_AUTH_STATE_PATH: /var/lib/api-for-cursor/auth-state.json
     volumes:
-      - router-data:/var/lib/api-for-cursor
+      # Retained read-only for explicit legacy import; no runtime file state.
+      - router-data:/var/lib/api-for-cursor:ro
     ports:
       - "${API_PORT:-6718}:6718"
     healthcheck:
@@ -57,3 +95,5 @@ services:
 
 volumes:
   router-data:
+  postgres-data:
+  redis-data:

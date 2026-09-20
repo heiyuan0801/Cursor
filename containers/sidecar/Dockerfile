@@ -1,14 +1,21 @@
-FROM oven/bun:1.3.9 AS build
+FROM oven/bun:1.3.9 AS bun
+FROM node:22-bookworm-slim AS build
+
+COPY --from=bun /usr/local/bin/bun /usr/local/bin/bun
 
 WORKDIR /src
 
-COPY worker ./worker
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY core ./core
 COPY sidecar ./sidecar
 
 # Bundle the API and Bun runtime into one executable so the production image
 # does not need the source tree or a JavaScript package manager at runtime.
 RUN mkdir -p /out \
-  && bun build sidecar/server.ts --compile --outfile /out/api-for-cursor
+  && bun build sidecar/server.ts --compile --outfile /out/api-for-cursor \
+  && bun build sidecar/migrate.ts --compile --outfile /out/cursor2api-migrate
 
 FROM node:22-bookworm-slim AS web
 
@@ -33,6 +40,7 @@ RUN apt-get update \
   && chown api:api /var/lib/api-for-cursor
 
 COPY --from=build /out/api-for-cursor /usr/local/bin/api-for-cursor
+COPY --from=build /out/cursor2api-migrate /usr/local/bin/cursor2api-migrate
 COPY --from=web /src/dist/client /opt/api-for-cursor/public
 
 ENV NODE_ENV=production \

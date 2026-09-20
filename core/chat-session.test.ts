@@ -4,7 +4,7 @@ import {
   newTurnMessages,
   newTurnStartIndex,
   rememberChatSession,
-  resetChatSessionCacheForTest,
+  configureChatSessionStore,
   resolveChatSession,
   type ChatSessionMessage
 } from "./chat-session";
@@ -30,7 +30,11 @@ async function answerTurn(messages: ChatSessionMessage[], reply: string, owner =
 
 describe("chat session fingerprinting", () => {
   beforeEach(() => {
-    resetChatSessionCacheForTest();
+    const entries = new Map<string, { sessionKey: string; updatedAt: number }>();
+    configureChatSessionStore({
+      async take(key) { const value = entries.get(key); entries.delete(key); return value; },
+      async set(key, value) { entries.set(key, value); }
+    });
     counter = 0;
   });
 

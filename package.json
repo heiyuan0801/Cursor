@@ -17,19 +17,18 @@
     "start:local": "node server.mjs start",
     "stop:local": "node server.mjs stop",
     "dev": "node server.mjs start",
-    "dev:worker": "vite --host 0.0.0.0",
     "build": "vite build",
     "build:client": "vite build --config vite.client.config.ts",
     "preview": "vite preview --host 0.0.0.0",
     "sdk:opencode-bridge": "node scripts/cursor-sdk-local-agent-bridge.mjs",
     "sdk:responses": "node scripts/cursor-sdk-responses-proxy.mjs",
     "test": "vitest run",
-    "test:sidecar": "cd sidecar && bun test",
+    "test:sidecar": "vitest run sidecar",
+    "db:migrate": "bun sidecar/migrate.ts",
+    "db:import": "bun sidecar/migrate.ts --import",
     "test:watch": "vitest",
-    "typecheck": "tsc --noEmit",
-    "deploy": "vite build && wrangler deploy",
-    "db:migrate:local": "wrangler d1 migrations apply composer-api --local",
-    "db:migrate:remote": "wrangler d1 migrations apply composer-api --remote"
+    "typecheck": "tsc --noEmit && tsc -p sidecar/tsconfig.json",
+    "dev:client": "vite --host 127.0.0.1"
   },
   "keywords": [
     "cursor",
@@ -37,20 +36,21 @@
     "openai",
     "chat-completions",
     "responses-api",
-    "cloudflare-workers"
+    "postgresql",
+    "redis"
   ],
   "license": "MIT",
   "dependencies": {
-    "@cloudflare/containers": "^0.3.4",
     "@cursor/sdk": "^1.0.27",
-    "lucide": "^0.557.0"
+    "ioredis": "^6.0.0",
+    "lucide": "^0.557.0",
+    "pg": "^8.23.0"
   },
   "devDependencies": {
-    "@cloudflare/vite-plugin": "^1.37.2",
-    "@cloudflare/workers-types": "^4.20260520.0",
+    "@electric-sql/pglite": "^0.5.8",
+    "@types/pg": "^8.23.1",
     "typescript": "^5.9.3",
     "vite": "^8.0.13",
-    "vitest": "^4.0.15",
-    "wrangler": "^4.93.0"
+    "vitest": "^4.0.15"
   }
 }

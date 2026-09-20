@@ -32,7 +32,7 @@
 
 另有 `GET /v1/models`（动态模型列表）和 `GET /health`（健康检查）。Codex / Claude Code 的工具调用经 `@cursor/sdk` 本地 Bridge 转发。
 
-支持 **Windows / Linux / macOS** 本地部署；可选 [Windows 托盘应用](desktop/README.md)（仅 Windows）；也保留 Cloudflare Worker 远程部署路径。
+支持 **Windows / Linux / macOS** 本地部署；可选 [Windows 托盘应用](desktop/README.md)（仅 Windows）。所有部署均需 PostgreSQL + Redis；旧 Worker/D1 入口已移除。
 
 ### 目录结构
 
@@ -40,7 +40,8 @@
 cursor2api/
 ├── sidecar/          # 跨平台 API 网关（Responses / Messages / Chat）— Linux 部署核心
 ├── scripts/          # SDK Bridge、server.mjs 等
-├── worker/           # 协议转换逻辑 + Cloudflare Worker
+├── core/             # 协议转换、Cursor SDK 客户端、计费与会话接口
+├── migrations/postgres/ # PostgreSQL 表结构
 ├── server.mjs        # 本地启动 CLI（start / stop / claude / codex）
 ├── desktop/          # 可选：Windows Tauri 托盘应用（Linux 不需要）
 └── ...
@@ -51,7 +52,7 @@ cursor2api/
 | `sidecar/` + `server.mjs` | 全平台 | ✅ |
 | `scripts/cursor-sdk-local-agent-bridge.mjs` | 全平台 | ✅ |
 | `desktop/` | 仅 Windows | ❌ |
-| `worker/`（Cloudflare） | 云端 | 可选 |
+| `core/` + PostgreSQL + Redis | 全平台 | ✅ |
 
 ### 项目架构
 
@@ -72,7 +73,7 @@ flowchart LR
     subgraph Core["网关核心域"]
         direction LR
         Sidecar["Sidecar 服务<br/>Bun · 协议转换"]
-        OpenAI["worker/openai.ts<br/>Responses · Chat"]
+        OpenAI["core/openai.ts<br/>Responses · Chat"]
         Anthropic["anthropic.ts<br/>Messages"]
         OpenAI --- Anthropic
         Sidecar --> OpenAI
@@ -83,6 +84,10 @@ flowchart LR
         NodeBridge["Node Bridge<br/>@cursor/sdk"]
     end
 
+    Postgres["PostgreSQL<br/>账号 · 密钥 · 日志"]
+    Redis["Redis<br/>会话 · 缓存 · 账号绑定"]
+    Sidecar --> Postgres
+    Sidecar --> Redis
     Upstream["🌐 Cursor 后端"]
 
     Codex --> Sidecar
@@ -109,7 +114,7 @@ Sidecar 负责三种协议的入站解析与出站整形；SDK Bridge 用官方 
 | **工具** | Codex `exec` 等 Responses 工具、Claude Code 读写文件等 Messages 工具，经 SDK Bridge 转发 |
 | **上下文** | Claude Code 1M 上下文（`claude-opus-5[1m]` 或 `anthropic-beta` 头） |
 | **可靠性** | 多 Key 自动路由和账单熔断；SDK 瞬时断连自动重试；Bridge 凭据定期刷新 |
-| **部署** | 本地 sidecar + bridge；可选 Windows Tauri 托盘；Cloudflare Worker |
+| **部署** | sidecar + bridge + PostgreSQL + Redis；可选 Windows Tauri 托盘 |
 
 ### 协议边界
 
@@ -137,6 +142,11 @@ Sidecar 负责三种协议的入站解析与出站整形；SDK Bridge 用官方 
 git clone https://github.com/NGLSG/cursor2api.git
 cd cursor2api
 npm ci   # 或 bun install
+
+# 先准备 PostgreSQL 16+ 和 Redis 7+，并导出连接配置
+export DATABASE_URL="postgresql://cursor2api:CHANGE_ME@127.0.0.1:5432/cursor2api"
+export REDIS_URL="redis://127.0.0.1:6379"
+# 多实例必须使用相同的 ENCRYPTION_KEY；旧版升级请先阅读下方迁移文档
 
 # 启动 Sidecar + SDK Bridge（前台，持续输出日志）
 npm run dev
@@ -189,6 +199,7 @@ export CURSOR_SDK_BRIDGE_TOKEN=$(openssl rand -hex 16)
 node scripts/cursor-sdk-local-agent-bridge.mjs
 
 # 终端 2 — Sidecar API
+# 同样设置 DATABASE_URL（或 PG*）、REDIS_URL、ENCRYPTION_KEY，并使用终端 1 的 Bridge Token
 export PORT=6718
 export CURSOR_SDK_BRIDGE_URL=http://127.0.0.1:6719/sdk
 bun run sidecar/server.ts
@@ -209,34 +220,27 @@ bun run sidecar/server.ts
 
 ### 远程部署
 
-**Cloudflare Worker**（仓库自带 `worker/` + D1）：
-
-```bash
-npm run deploy
-```
-
-**自建 VPS / Linux**：与本地相同，启动 sidecar + bridge 后用 systemd 或 Docker 守护进程即可。
+**自建 VPS / Linux**：使用下方 Docker Compose 启动 PostgreSQL、Redis、API 和 SDK Bridge。外层反向代理提供 HTTPS；不再支持 Worker/D1 部署。
 
 ### Docker Compose（预构建镜像）
 
-仓库提供两个容器：预编译的 API Sidecar 和 Node SDK Bridge。镜像会发布到
+仓库提供 API Sidecar 和 Node SDK Bridge 两个应用镜像，配套 PostgreSQL 与 Redis 共四个服务。镜像会发布到
 Docker Hub（`docker.io/<用户名>/cursor2api-api` 和
 `docker.io/<用户名>/cursor2api-bridge`）；保留的标准 Compose 也可以根据仓库中的
 Dockerfile 本地构建。
 
 ```bash
 cp .env.docker.example .env
-# 编辑 .env，设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY
+# 编辑 .env，设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY、POSTGRES_PASSWORD
 # Cursor Key 可以预先通过 CURSOR_API_KEY(S) 配置，也可以启动后在 Dashboard 导入
 
-# 使用仓库中的 Compose（可拉取镜像，也可 `--build` 本地构建）
-docker compose pull
-docker compose up
+# 使用当前仓库的迁移版本（改动尚未发布到远程镜像时必须本地构建）
+docker compose up --build
 ```
 
 Compose 同样只对外暴露一个 `6718` 端口。打开 `http://127.0.0.1:6718/dashboard`，使用 `.env` 中的 `ADMIN_PASSWORD` 登录即可管理凭据并创建客户端 Key。
 
-`docker compose up` 默认以前台模式运行并持续输出两个容器的日志，按 `Ctrl+C`
+`docker compose up` 默认以前台模式运行并持续输出四个服务的日志，按 `Ctrl+C`
 停止。另一个终端可以检查状态：
 
 ```bash
@@ -260,11 +264,13 @@ docker compose down
 mkdir -p cursor2api && cd cursor2api
 curl -fsSLo docker-compose.yml https://raw.githubusercontent.com/NGLSG/Cursor2API/master/docker-compose.dockerhub.yml
 curl -fsSLo .env https://raw.githubusercontent.com/NGLSG/Cursor2API/master/.env.docker.example
-# 编辑 .env：至少设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY
+# 编辑 .env：至少设置 ADMIN_PASSWORD、CURSOR_SDK_BRIDGE_TOKEN、ENCRYPTION_KEY、POSTGRES_PASSWORD
 docker compose pull
 docker compose up -d
 docker compose ps
 ```
+
+Compose 会启动 PostgreSQL、Redis、SDK Bridge 和 API 四个服务，但只对外暴露一个 `6718` 端口。管理员密码哈希、客户端密钥哈希、加密的 Cursor 凭据、禁用状态、设置和使用日志统一写入 PostgreSQL；管理员会话、对话映射、模型目录、Responses 缓存与轮询计数统一写入 Redis。
 
 默认使用 `docker.io/nglsg/cursor2api-api:latest` 和
 `docker.io/nglsg/cursor2api-bridge:latest`。如果你发布到自己的 Docker Hub
@@ -353,7 +359,7 @@ node server.mjs claude -- "你的提示词"
 
 cursor2api **不使用固定模型清单**。单 Key 模式下，`GET /v1/models` 实时读取该 Cursor 账号可用模型；多 Key 网关模式下，它会并行读取每把 Key 的模型目录并仅返回交集。
 
-对话请求根据传入的 `model` 自动选择支持该模型的 Cursor Key。某把 Key 返回账单、额度或余额错误时，网关会将该 Key 的对应模型标记为禁用并切换到下一把 Key；限流、网络和临时 SDK 错误不会形成永久禁用。Docker 的禁用状态保存在 `router-data` 卷，Cloudflare Worker 则保存在 D1。
+对话请求根据传入的 `model` 自动选择支持该模型的 Cursor Key。某把 Key 返回账单、额度或余额错误时，网关会将该 Key 的对应模型标记为禁用并切换到下一把 Key；限流、网络和临时 SDK 错误不会形成永久禁用。禁用状态统一持久化到 PostgreSQL，多实例立即共享。
 
 常见模型示例（以实际 `/v1/models` 返回为准）：
 
@@ -452,9 +458,12 @@ Sidecar 与 Bridge 通过环境变量配置，参考 [`.env.example`](.env.examp
 | `CURSOR_API_KEYS` | 多把 Cursor Key，支持逗号/换行、`label=key` 或 JSON 数组 | — |
 | `ADMIN_PASSWORD` | 控制台管理员密码；Compose 中必填 | — |
 | `PUBLIC_BASE_URL` | 可选的对外网关地址，控制台也可更新 | 请求地址 |
-| `LOCAL_AUTH_STATE_PATH` | 管理员凭据与客户端 Key 的状态文件 | 与路由状态相邻 |
+| `DATABASE_URL` / `PGHOST` | PostgreSQL 连接配置，保存全部业务持久状态 | 必填，无文件回退 |
+| `REDIS_URL` | Redis 7+ 地址，保存共享会话和缓存 | 必填 |
+| `REDIS_PREFIX` | Redis 键前缀；同一网关的副本须一致 | `cursor2api:` |
+| `CURSOR_ACCOUNT_STICKY_TTL_SECONDS` | 对话识别与账号绑定的空闲有效期，60–86400 秒，每次使用续期 | `7200` |
+| `ENCRYPTION_KEY` | Cursor 凭据加密密钥（至少 16 字符） | 本地脚本可复用已有配置；多实例必须一致 |
 | `CURSOR2API_API_KEY` | CLI 使用的客户端 `sk-…` Key | — |
-| `CURSOR_ROUTER_STATE_PATH` | Key+模型禁用状态文件 | 内存（Compose 使用数据卷） |
 | `CURSOR_SDK_BRIDGE_URL` | Bridge 地址 | — |
 | `CURSOR_SDK_BRIDGE_TOKEN` | Bridge 鉴权 Token | — |
 | `CURSOR_SDK_BRIDGE_HOST` | Bridge 绑定地址 | `127.0.0.1` |
@@ -463,7 +472,21 @@ Sidecar 与 Bridge 通过环境变量配置，参考 [`.env.example`](.env.examp
 > [!TIP]
 > SDK Bridge **必须用 Node 运行**（不能换 Bun）：`@cursor/sdk` 依赖 sqlite3 原生模块和 gRPC over HTTP/2。
 
-运行时日志与进程状态：`~/.cursor2api/`（Windows 为 `%USERPROFILE%\.cursor2api\`）
+本地启动器的进程记录、控制台输出和本机加密密钥配置仍在 `~/.cursor2api/`；它们不是业务数据库。使用日志与费用统计统一查询 PostgreSQL，支持“今天 / 昨天 / 近一周 / 近一月 / 全部”筛选，以及清理 7、30 或 90 天前的数据。
+
+Sidecar 启动时自动建表并校验 PostgreSQL、Redis 与加密配置，不再回退到文件或进程内鉴权。旧版升级必须先停止旧服务并显式导入数据，详见 [PostgreSQL + Redis 迁移指南](docs/POSTGRES_REDIS_MIGRATION.md)。旧 Worker/D1 源码与部署配置已移除；此改动不会自动删除远端资源。
+
+### 固定账号与会话缓存
+
+多账号默认采用**按对话固定账号**：新对话在可用账号间轮询分配，后续请求优先使用同一账号及 SDK 会话，不再逐请求换号。同一客户端 API Key 可以同时拥有多个独立对话；不同客户端 Key 的绑定相互隔离。
+
+- 推荐每个对话携带稳定的 `x-session-affinity: conversation-123`；同一对话保持 ID 不变，新对话或分叉对话换新 ID。也兼容 `x-opencode-session-id`、`x-opencode-session`、`x-session-id`。不要给所有对话使用一个固定 ID，`Idempotency-Key` 不用于会话绑定。
+- 未提供会话 ID 时，根据客户端回传的完整历史自动识别 Chat Completions、Responses 和 Anthropic Messages 的后续轮次。自动识别采用单次领取机制，重复前缀的分叉不会并发复用同一 SDK 会话。
+- Responses 可通过 `previous_response_id` 恢复历史；响应及其历史缓存保留 24 小时，`store: false` 不保存该响应。缓存归属当前客户端 Key，删除或过期后无法继续引用；升级前的旧响应缓存只有输出，需重新开始或显式发送完整历史。
+- 账号被停用、对应模型被禁用或确认不再支持时才重新分配。绑定账号的模型目录临时查询失败时返回 503，保留绑定。额度/计费失败在非流式响应返回前可换号重试；流式响应开始后不自动重放，后续请求再换号。
+- 绑定默认空闲 2 小时过期，可通过 `CURSOR_ACCOUNT_STICKY_TTL_SECONDS` 调整。换号、绑定过期、模型或工具配置变化时使用新的 SDK 会话并发送完整上下文，避免沿用过时会话。
+
+所有 API 副本必须共用 PostgreSQL、Redis 前缀及上述 TTL；SDK Bridge 仍保持单实例。除 Responses 的历史恢复外，固定会话 ID 不代替完整历史，客户端仍应发送完整对话以便冷启动或故障恢复。账号亲和性有助于上游缓存复用，但不保证缓存命中率，也不会把旧回答当作新回答直接返回。
 
 ## 常见问题
 
@@ -487,17 +510,19 @@ Sidecar 与 Bridge 通过环境变量配置，参考 [`.env.example`](.env.examp
 ## 开发验证
 
 ```bash
-npm test              # vitest（worker + bridge）
+npm test              # 协议、网关、PostgreSQL 与 SDK Bridge 回归
 npm run typecheck
-npm run test:sidecar   # 或 cd sidecar && bun test
+npm run test:sidecar
+npm run build          # 构建网关前端，无 Cloudflare 插件
 ```
+
+前端热更新可另开终端运行 npm run dev:client，开发代理将 /api、/v1 和 /health 转发到本机 6718 端口；需要先启动 PG/Redis 网关。
 
 ## 可选组件
 
 | 组件 | 说明 |
 | :-- | :-- |
 | [Windows 托盘应用](desktop/README.md) | Tauri 2 系统托盘，默认端口 8787，Credential Manager 存 Key，一键配置 Agent |
-| [Cloudflare Worker](worker/) | 远程多用户网关（需自行部署到 CF 账号） |
 
 ## 相关文档
 

@@ -1,8 +1,8 @@
-import { describe, expect, test } from "bun:test";
+import { describe, expect, test } from "vitest";
 import { mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CursorCredentialPool, canonicalModelId, isBillingError, parseCursorCredentialEnv } from "./router";
+import { CursorCredentialPool, canonicalModelId, isBillingError, parseCursorCredentialEnv } from "./test-helpers/legacy-router";
 
 const catalogs: Record<string, Array<{ id: string; aliases?: string[] }>> = {
   one: [{ id: "composer-2.5", aliases: ["default"] }, { id: "gpt-5.3-codex" }],

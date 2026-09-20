@@ -41,9 +41,22 @@ interface SessionEntry {
 }
 
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000;
-const MAX_TRACKED_CONVERSATIONS = 2048;
+let sessionTtlMs = SESSION_TTL_MS;
 
-const conversations = new Map<string, SessionEntry>();
+interface SharedConversationStore {
+  take(key: string): Promise<SessionEntry | undefined>;
+  set(key: string, value: SessionEntry, ttlSeconds: number): Promise<void>;
+}
+let sharedStore: SharedConversationStore | undefined;
+export function configureChatSessionStore(
+  store?: SharedConversationStore,
+  ttlSeconds = SESSION_TTL_MS / 1000,
+): void {
+  if (!Number.isInteger(ttlSeconds) || ttlSeconds < 60 || ttlSeconds > 86400)
+    throw new Error("Conversation TTL must be between 60 and 86400 seconds");
+  sharedStore = store;
+  sessionTtlMs = ttlSeconds * 1000;
+}
 
 /**
  * Resolve the session key for an incoming chat request.
@@ -62,22 +75,36 @@ export async function resolveChatSession(
   messages: readonly ChatSessionMessage[],
   ownerKey: string,
   now: number,
-  newSessionKey: () => string
+  newSessionKey: () => string,
 ): Promise<ChatSessionResolution> {
-  pruneConversations(now);
+  if (!sharedStore) throw new Error("Shared conversation store is required");
   const lastAssistant = lastAssistantIndex(messages);
   if (lastAssistant < 0) {
-    return { sessionKey: newSessionKey(), newTurnStart: messages.length, resumed: false };
+    return {
+      sessionKey: newSessionKey(),
+      newTurnStart: messages.length,
+      resumed: false,
+    };
   }
 
-  const fingerprint = await conversationFingerprint(messages.slice(0, lastAssistant + 1), ownerKey);
-  const existing = conversations.get(fingerprint);
-  if (!existing) {
-    return { sessionKey: newSessionKey(), newTurnStart: messages.length, resumed: false };
+  const fingerprint = await conversationFingerprint(
+    messages.slice(0, lastAssistant + 1),
+    ownerKey,
+  );
+  const existing = await sharedStore.take(fingerprint);
+  if (!existing || existing.updatedAt + sessionTtlMs < now) {
+    return {
+      sessionKey: newSessionKey(),
+      newTurnStart: messages.length,
+      resumed: false,
+    };
   }
 
-  conversations.delete(fingerprint);
-  return { sessionKey: existing.sessionKey, newTurnStart: lastAssistant + 1, resumed: true };
+  return {
+    sessionKey: existing.sessionKey,
+    newTurnStart: lastAssistant + 1,
+    resumed: true,
+  };
 }
 
 /**
@@ -94,27 +121,38 @@ export async function rememberChatSession(input: {
   ownerKey: string;
   sessionKey: string;
   assistantText: string;
-  assistantToolCalls?: ReadonlyArray<{ function: { name: string; arguments: string } }>;
+  assistantToolCalls?: ReadonlyArray<{
+    function: { name: string; arguments: string };
+  }>;
   now: number;
 }): Promise<void> {
   const toolCalls = (input.assistantToolCalls ?? []).map((toolCall) => ({
-    function: { name: toolCall.function.name, arguments: toolCall.function.arguments }
+    function: {
+      name: toolCall.function.name,
+      arguments: toolCall.function.arguments,
+    },
   }));
   const assistant: ChatSessionMessage = {
     role: "assistant",
     content: input.assistantText,
-    ...(toolCalls.length ? { tool_calls: toolCalls } : {})
+    ...(toolCalls.length ? { tool_calls: toolCalls } : {}),
   };
-  const fingerprint = await conversationFingerprint([...input.messages, assistant], input.ownerKey);
-  conversations.delete(fingerprint);
-  conversations.set(fingerprint, { sessionKey: input.sessionKey, updatedAt: input.now });
-  pruneConversations(input.now);
+  const fingerprint = await conversationFingerprint(
+    [...input.messages, assistant],
+    input.ownerKey,
+  );
+  if (!sharedStore) throw new Error("Shared conversation store is required");
+  await sharedStore.set(
+    fingerprint,
+    { sessionKey: input.sessionKey, updatedAt: input.now },
+    sessionTtlMs / 1000,
+  );
 }
 
 /** Messages of the new turn — everything the previous turn had not seen yet. */
 export function newTurnMessages(
   messages: readonly ChatSessionMessage[],
-  resolution: ChatSessionResolution
+  resolution: ChatSessionResolution,
 ): ChatSessionMessage[] {
   if (!resolution.resumed) return [];
   return messages.slice(resolution.newTurnStart);
@@ -125,7 +163,9 @@ export function newTurnMessages(
  * `messages.length` when no assistant has spoken yet, i.e. nothing is incremental. Used when
  * the client supplies its own session key and no fingerprint lookup is needed.
  */
-export function newTurnStartIndex(messages: readonly ChatSessionMessage[]): number {
+export function newTurnStartIndex(
+  messages: readonly ChatSessionMessage[],
+): number {
   const lastAssistant = lastAssistantIndex(messages);
   return lastAssistant < 0 ? messages.length : lastAssistant + 1;
 }
@@ -135,10 +175,6 @@ export function chatMessagesFromBody(body: unknown): ChatSessionMessage[] {
   return Array.isArray(messages) ? (messages as ChatSessionMessage[]) : [];
 }
 
-export function resetChatSessionCacheForTest(): void {
-  conversations.clear();
-}
-
 function lastAssistantIndex(messages: readonly ChatSessionMessage[]): number {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     if (messages[index]?.role === "assistant") return index;
@@ -146,21 +182,25 @@ function lastAssistantIndex(messages: readonly ChatSessionMessage[]): number {
   return -1;
 }
 
-async function conversationFingerprint(messages: readonly ChatSessionMessage[], ownerKey: string): Promise<string> {
+async function conversationFingerprint(
+  messages: readonly ChatSessionMessage[],
+  ownerKey: string,
+): Promise<string> {
   const canonical = messages.map(canonicalMessage).join("\n\u0000\n");
   return sha256Hex(`${ownerKey}\n\u0000\u0000\n${canonical}`);
 }
 
 /**
  * Canonical form of a message, built only from the parts a client reliably echoes back:
- * the role, the text, and the tool calls. Multimodal parts and provider-specific extras are
- * deliberately reduced to a coarse marker — over-matching would risk reusing a session for a
- * different conversation, while under-matching only costs a cache miss.
+ * the role, the text, and the tool calls. Non-text content is serialized in full: a coarse
+ * image marker could reuse a session for a different image. Under-matching only costs a
+ * cache miss, whereas over-matching could mix up conversations.
  */
 function canonicalMessage(message: ChatSessionMessage): string {
   const role = typeof message.role === "string" ? message.role : "user";
   const parts = [role, messageText(message.content)];
-  if (typeof message.tool_call_id === "string") parts.push(`tool_call_id=${message.tool_call_id}`);
+  if (typeof message.tool_call_id === "string")
+    parts.push(`tool_call_id=${message.tool_call_id}`);
   if (typeof message.name === "string") parts.push(`name=${message.name}`);
   if (Array.isArray(message.tool_calls)) {
     parts.push(message.tool_calls.map(canonicalToolCall).join("\u0001"));
@@ -179,29 +219,30 @@ function canonicalToolCall(value: unknown): string {
 
 function messageText(content: unknown): string {
   if (typeof content === "string") return content;
-  if (!Array.isArray(content)) return content == null ? "" : "[non-text]";
+  if (!Array.isArray(content))
+    return content == null ? "" : stableContent(content);
   return content
     .map((part) => {
       if (typeof part === "string") return part;
       if (typeof part !== "object" || part === null) return "";
       const record = part as { type?: unknown; text?: unknown };
       if (typeof record.text === "string") return record.text;
-      return typeof record.type === "string" ? `[${record.type}]` : "";
+      return stableContent(record);
     })
     .join("");
 }
 
-function pruneConversations(now: number): void {
-  for (const [fingerprint, entry] of conversations) {
-    if (entry.updatedAt + SESSION_TTL_MS < now) conversations.delete(fingerprint);
-  }
-  if (conversations.size <= MAX_TRACKED_CONVERSATIONS) return;
-  // Map preserves insertion order and every touch re-inserts, so the oldest keys come first.
-  const excess = conversations.size - MAX_TRACKED_CONVERSATIONS;
-  let removed = 0;
-  for (const fingerprint of conversations.keys()) {
-    conversations.delete(fingerprint);
-    removed += 1;
-    if (removed >= excess) break;
-  }
+function stableContent(value: unknown): string {
+  if (Array.isArray(value))
+    return "[" + value.map(stableContent).join(",") + "]";
+  if (value && typeof value === "object")
+    return (
+      "{" +
+      Object.entries(value)
+        .sort(([a], [b]) => a.localeCompare(b))
+        .map(([key, part]) => JSON.stringify(key) + ":" + stableContent(part))
+        .join(",") +
+      "}"
+    );
+  return JSON.stringify(value) ?? "";
 }

@@ -2,16 +2,16 @@
  * Anthropic Messages API <-> OpenAI/Cursor adapter (sidecar-local, pure translation).
  *
  * Lets Claude Code (CLI) use Cursor's Composer via ANTHROPIC_BASE_URL: we convert an
- * Anthropic `/v1/messages` request into the OpenAI-shaped body that `worker/openai.ts`
+ * Anthropic `/v1/messages` request into the OpenAI-shaped body that `core/openai.ts`
  * `prepareChatRequest` already understands, run it through the existing Cursor SDK path,
  * then translate the resulting `CursorTextEvent` stream back into an Anthropic `Message`
  * (non-stream) or Anthropic SSE events (stream).
  *
  * See docs/superpowers/specs/2026-06-02-anthropic-endpoint-claude-code-design.md.
  */
-import type { CursorTextEvent } from "../worker/cursor";
-import type { CursorTokenUsage, CursorToolCall } from "../worker/types";
-import { toOpenAiToolCalls, type OpenAiToolSpec, type ToolCallContext } from "../worker/openai";
+import type { CursorTextEvent } from "../core/cursor";
+import type { CursorTokenUsage, CursorToolCall } from "../core/types";
+import { toOpenAiToolCalls, type OpenAiToolSpec, type ToolCallContext } from "../core/openai";
 
 const PRIMARY_MODEL = "auto";
 
@@ -340,7 +340,7 @@ export async function* anthropicSseEvents(opts: {
   toolContext?: ToolCallContext;
   /** Called once the stream finishes cleanly, with the assistant turn as the client will
    * replay it: the completed text and the tool_use blocks that were emitted. */
-  onDone?: (text: string, toolUseBlocks: Array<Record<string, unknown>>) => void;
+  onDone?: (text: string, toolUseBlocks: Array<Record<string, unknown>>) => void | Promise<void>;
 }): AsyncGenerator<{ event: string; data: Record<string, unknown> }> {
   yield {
     event: "message_start",
@@ -413,6 +413,8 @@ export async function* anthropicSseEvents(opts: {
   if (textIndex !== -1) {
     yield { event: "content_block_stop", data: { type: "content_block_stop", index: textIndex } };
   }
+  // Finish the shared conversation write before the client starts its next turn.
+  await opts.onDone?.(text, toolUseBlocks);
   yield {
     event: "message_delta",
     data: {
@@ -422,5 +424,4 @@ export async function* anthropicSseEvents(opts: {
     }
   };
   yield { event: "message_stop", data: { type: "message_stop" } };
-  opts.onDone?.(text, toolUseBlocks);
 }

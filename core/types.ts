@@ -1,8 +1,15 @@
 export interface Env {
-  ASSETS: Fetcher;
-  DB: D1Database;
-  RELEASES?: R2Bucket;
-  CURSOR_SDK_BRIDGE_CONTAINER?: DurableObjectNamespace;
+  SDK_SESSION_STORE?: {
+    get(
+      key: string,
+    ): Promise<{ agentId: string; updatedAt: number } | undefined>;
+    set(
+      key: string,
+      value: { agentId: string; updatedAt: number },
+      ttlSeconds: number,
+    ): Promise<void>;
+    delete(key: string): Promise<void>;
+  };
   ENCRYPTION_KEY?: string;
   CURSOR_API_BASE?: string;
   CURSOR_BACKEND_BASE_URL?: string;
@@ -13,11 +20,6 @@ export interface Env {
   CURSOR_SDK_BRIDGE_TIMEOUT_MS?: string;
   CURSOR_SDK_BRIDGE_URL?: string;
   CURSOR_SDK_CLIENT_VERSION?: string;
-  GITHUB_RELEASE_DISPATCH_TOKEN?: string;
-  GITHUB_RELEASE_REPOSITORY?: string;
-  NOTARY_WEBHOOK_TOKEN?: string;
-  WAITLIST_API_TOKEN?: string;
-  WAITLIST_SOURCE?: string;
 }
 
 export interface Deps {
@@ -35,62 +37,18 @@ export interface CursorMe {
   createdAt: string;
 }
 
-export interface AccountRow {
-  id: string;
-  cursor_user_id: string | null;
-  cursor_email: string | null;
-  cursor_name: string | null;
-  cursor_api_key_ciphertext: string;
-  cursor_api_key_iv: string;
-  cursor_api_key_hint: string | null;
-  waitlist_opt_in: number;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface ApiKeyRow {
-  id: string;
-  account_id: string;
-  prefix: string;
-  key_hash: string;
-  name: string;
-  created_at: string;
-  last_used_at: string | null;
-  revoked_at: string | null;
-}
-
-export interface CursorCredentialRow {
-  id: string;
-  account_id: string;
-  key_hash: string;
-  prefix: string;
-  label: string;
-  cursor_api_key_ciphertext: string;
-  cursor_api_key_iv: string;
-  cursor_api_key_hint: string | null;
-  status: "active" | "disabled";
-  disabled_reason: string | null;
-  created_at: string;
-  updated_at: string;
-}
-
-export interface CursorCredentialModelRow {
-  credential_id: string;
-  model_id: string;
-  disabled_reason: string | null;
-  disabled_at: string | null;
-  updated_at: string;
-}
-
-export interface AuthenticatedAccount {
-  account: AccountRow;
-  apiKey: ApiKeyRow;
-  cursorApiKey: string;
-}
-
 export type CursorImage =
-  | { url: string; dimension?: { width: number; height: number }; uuid?: string }
-  | { data: string; mimeType: string; dimension?: { width: number; height: number }; uuid?: string };
+  | {
+      url: string;
+      dimension?: { width: number; height: number };
+      uuid?: string;
+    }
+  | {
+      data: string;
+      mimeType: string;
+      dimension?: { width: number; height: number };
+      uuid?: string;
+    };
 
 export interface CursorPrompt {
   text: string;
